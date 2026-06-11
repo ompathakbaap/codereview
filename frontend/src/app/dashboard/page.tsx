@@ -303,7 +303,7 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
 
 export default function DashboardPage() {
   const router = useRouter();
-  const { user, token, logout, hydrate } = useAuthStore();
+  const { user, token, logout, hydrate, isHydrated } = useAuthStore();
   const { reviews, fetchReviews, isLoading } = useReviewStore();
   const [showCreate, setShowCreate] = useState(false);
   const [stats, setStats] = useState<ReviewStats | null>(null);
@@ -312,9 +312,10 @@ export default function DashboardPage() {
   useEffect(() => { hydrate(); }, []);
 
   useEffect(() => {
-    if (!token) { router.push("/auth"); return; }
-    fetchReviews();
-  }, [token]);
+  if (!isHydrated) return;
+  if (!token) { router.push("/auth"); return; }
+  fetchReviews();
+}, [isHydrated, token]);
 
   useEffect(() => {
     if (token && reviews.length > 0 && !stats) {

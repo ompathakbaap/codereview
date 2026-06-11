@@ -7,6 +7,7 @@ import api from "@/lib/api";
 interface AuthState {
   user: User | null;
   token: string | null;
+  isHydrated: boolean;
   setAuth: (token: string, user: User) => void;
   logout: () => void;
   hydrate: () => void;
@@ -15,6 +16,7 @@ interface AuthState {
 export const useAuthStore = create<AuthState>((set) => ({
   user: null,
   token: null,
+  isHydrated: false,
 
   setAuth: (token, user) => {
     localStorage.setItem("token", token);
@@ -25,7 +27,7 @@ export const useAuthStore = create<AuthState>((set) => ({
   logout: () => {
     localStorage.removeItem("token");
     localStorage.removeItem("user");
-    set({ token: null, user: null });
+    set({ token: null, user: null, isHydrated: false });
   },
 
   hydrate: () => {
@@ -36,6 +38,7 @@ export const useAuthStore = create<AuthState>((set) => ({
         set({ token, user: JSON.parse(raw) });
       } catch {}
     }
+    set({ isHydrated: true });
   },
 }));
 

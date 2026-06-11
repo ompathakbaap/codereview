@@ -75,7 +75,7 @@ function StreamingPanel({ nodeProgress, activeNodes }: {
 export default function ReviewPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
-  const { token, user, hydrate } = useAuthStore();
+  const { token, user, hydrate, isHydrated } = useAuthStore();
   const {
     activeReview, issues, comments, activeUsers,
     fetchReview, fetchComments, addComment, isLoading, appendIssues, setReviewStatus,
@@ -97,12 +97,13 @@ export default function ReviewPage() {
   useEffect(() => { hydrate(); }, []);
 
   useEffect(() => {
+    if (!isHydrated) return;
     if (!token) { router.push("/auth"); return; }
     if (id) {
       fetchReview(id).then(() => {});
       fetchComments(id);
     }
-  }, [token, id]);
+  }, [isHydrated, token, id]);
 
   // Auto-start SSE stream when review is running
   useEffect(() => {
