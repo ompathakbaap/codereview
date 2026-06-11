@@ -20,7 +20,7 @@ async def publish(channel: str, message: dict) -> None:
     """Publish a message to a Redis channel (review room)."""
     r = await get_redis()
     await r.publish(channel, json.dumps(message))
-    logger.info("redis.publish", channel=channel, event=message.get("type"))
+    logger.info("redis.publish", channel=channel, event_type=message.get("type"))
 
 
 async def subscribe(channel: str) -> AsyncIterator[dict]:
