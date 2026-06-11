@@ -95,6 +95,7 @@ async def _run_agent_and_persist(review_id: str, code: str, language: str, db_ur
             })
 
         except Exception as e:
+            logger.error("agent.failed", review_id=review_id, error=str(e), exc_info=True)
             async with AsyncSessionLocal() as err_db:
                 r = await err_db.execute(select(Review).where(Review.id == uuid.UUID(review_id)))
                 review = r.scalar_one_or_none()
