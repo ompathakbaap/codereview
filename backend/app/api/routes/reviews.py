@@ -139,6 +139,7 @@ async def create_review(
         "language": body.language,
     })
 
+    await session.refresh(review, ["issues"])
     return ReviewOut.model_validate(review)
 
 
