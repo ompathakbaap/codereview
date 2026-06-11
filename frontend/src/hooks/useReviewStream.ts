@@ -58,7 +58,7 @@ export function useReviewStream(reviewId: string, token: string | null) {
       setState(s => {
         switch (event.type) {
           case "node_start": {
-            const next = new Set(s.activeNodes);\n
+            const next = new Set(s.activeNodes);
 	    next.add(event.node);
             return {
               ...s,
