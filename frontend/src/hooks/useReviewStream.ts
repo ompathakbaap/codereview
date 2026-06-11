@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+﻿import { useEffect, useRef, useState, useCallback } from "react";
 import { SSEEvent, Issue } from "@/types";
 
 interface StreamState {
@@ -10,7 +10,7 @@ interface StreamState {
 }
 
 /**
- * useReviewStream — SSE hook for real-time agent progress
+ * useReviewStream â€” SSE hook for real-time agent progress
  *
  * Connects to GET /api/reviews/{id}/stream and exposes:
  *  - isStreaming: true while SSE is active
@@ -58,8 +58,7 @@ export function useReviewStream(reviewId: string, token: string | null) {
       setState(s => {
         switch (event.type) {
           case "node_start": {
-            const next = new Map(s.activeNodes);
-            next.add(event.node);
+            const next = new Set(s.activeNodes);\n            next.add(event.node);
             return {
               ...s,
               activeNodes: new Set(next),
@@ -119,3 +118,4 @@ export function useReviewStream(reviewId: string, token: string | null) {
 
   return { ...state, start, stop };
 }
+
