@@ -1,13 +1,17 @@
+"use client";
 import type { Metadata } from "next";
 import "./globals.css";
 import { Toaster } from "react-hot-toast";
-
-export const metadata: Metadata = {
-  title: "CodeReview Agent",
-  description: "AI-powered real-time collaborative code review",
-};
+import { useEffect } from "react";
+import { useAuthStore } from "@/store/index";
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const hydrate = useAuthStore((s) => s.hydrate);
+
+  useEffect(() => {
+    hydrate();
+  }, []);
+
   return (
     <html lang="en">
       <body>
