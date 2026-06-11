@@ -1,0 +1,30 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+websockets==13.1
+python-dotenv==1.0.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# Database (Neon.tech free PostgreSQL)
+asyncpg==0.30.0
+sqlalchemy[asyncio]==2.0.36
+alembic==1.14.0
+
+# Redis (Upstash free)
+redis==5.2.1
+
+# LangGraph + Groq (free tier — console.groq.com)
+langchain==0.3.12
+langchain-groq==0.2.4
+langchain-core==0.3.25
+langgraph==0.2.59
+
+# Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.20
+
+# Utils
+httpx==0.28.1
+structlog==24.4.0
+slowapi==0.1.9

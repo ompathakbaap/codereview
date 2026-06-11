@@ -1,0 +1,58 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=DM+Sans:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0d0f14;
+  --surface: #13161e;
+  --border: #1e2330;
+  --accent: #00e5ff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: #e8eaf0;
+  font-family: 'DM Sans', sans-serif;
+  antialiased: true;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #2a3045; }
+
+/* Code editor overrides */
+.cm-editor { border-radius: 8px; }
+.cm-scroller { font-family: 'JetBrains Mono', monospace !important; font-size: 13px; }
+.cm-gutters { background: #0a0c11 !important; border-right: 1px solid var(--border) !important; }
+
+/* Issue severity badges */
+.badge-critical { @apply bg-red-500/20 text-red-400 border border-red-500/30; }
+.badge-high { @apply bg-orange-500/20 text-orange-400 border border-orange-500/30; }
+.badge-medium { @apply bg-yellow-500/20 text-yellow-400 border border-yellow-500/30; }
+.badge-low { @apply bg-blue-500/20 text-blue-400 border border-blue-500/30; }
+.badge-info { @apply bg-cyan-500/20 text-cyan-400 border border-cyan-500/30; }
+
+/* Category icons */
+.cat-bug { color: #ff4d6d; }
+.cat-security { color: #ff6b35; }
+.cat-style { color: #7c83fd; }
+.cat-performance { color: #f9c74f; }
+
+/* Glow effect for accent elements */
+.glow-accent {
+  box-shadow: 0 0 20px rgba(0, 229, 255, 0.15);
+}
+
+/* Pulse animation for running state */
+@keyframes pulse-ring {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 229, 255, 0.4); }
+  70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(0, 229, 255, 0); }
+  100% { transform: scale(0.95); }
+}
+.pulse-ring { animation: pulse-ring 1.5s ease-in-out infinite; }

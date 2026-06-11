@@ -1,0 +1,359 @@
+"""
+LangGraph-powered AI Code Review Agent
+Uses Groq (free tier, no credit card) with llama-3.3-70b-versatile.
+
+Graph flow:
+  START → analyze_structure → [bug_check, security_check, style_check, perf_check] → aggregate → END
+
+Each node runs in parallel; results are merged in aggregate.
+"""
+import json
+import re
+from typing import TypedDict, Annotated, List
+from langgraph.graph import StateGraph, END
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, SystemMessage
+from app.core.config import settings
+import structlog
+
+logger = structlog.get_logger()
+
+
+# ── State ──────────────────────────────────────────────────────────────────────
+
+def merge_issues(a: list, b: list) -> list:
+    return a + b
+
+
+class ReviewState(TypedDict):
+    code: str
+    language: str
+    review_id: str
+    structure_summary: str
+    issues: Annotated[List[dict], merge_issues]
+    status: str
+    error: str
+
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+
+def get_llm() -> ChatGroq:
+    return ChatGroq(
+        api_key=settings.GROQ_API_KEY,
+        model=settings.GROQ_MODEL,
+        temperature=0.1,
+    )
+
+
+def _parse_issues(raw: str, category: str) -> list[dict]:
+    """Safely parse JSON array of issues from LLM output."""
+    try:
+        clean = raw.strip()
+        # Strip markdown code fences if present
+        clean = re.sub(r"```json\s*|```\s*", "", clean).strip()
+        data = json.loads(clean)
+        issues = data if isinstance(data, list) else data.get("issues", [])
+        for issue in issues:
+            issue["category"] = category
+        return issues
+    except Exception as e:
+        logger.warning("parse_issues_failed", category=category, error=str(e))
+        return []
+
+
+# ── Node: Analyze Structure ────────────────────────────────────────────────────
+
+async def analyze_structure(state: ReviewState) -> dict:
+    llm = ChatGroq(
+        api_key=settings.GROQ_API_KEY,
+        model=settings.GROQ_MODEL,
+        temperature=0.1,
+    )
+    messages = [
+        SystemMessage(content="You are a senior software engineer. Briefly summarize what this code does in 2-3 sentences. Be concise."),
+        HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
+    ]
+    response = await llm.ainvoke(messages)
+    return {"structure_summary": response.content, "status": "running"}
+
+
+# ── Node: Bug Check ────────────────────────────────────────────────────────────
+
+BUG_SYSTEM = """You are a code bug detector. Analyze the code for bugs, logic errors, null pointer issues, off-by-one errors, exception handling gaps, and incorrect assumptions.
+
+Respond ONLY with a valid JSON array (no markdown, no explanation). Each element:
+{
+  "severity": "critical|high|medium|low",
+  "line_start": "line number or null",
+  "line_end": "line number or null",
+  "title": "short title",
+  "description": "what the bug is",
+  "suggestion": "how to fix it",
+  "code_snippet": "relevant code snippet"
+}
+
+If no bugs found, return [].
+"""
+
+async def bug_check(state: ReviewState) -> dict:
+    llm = get_llm()
+    messages = [
+        SystemMessage(content=BUG_SYSTEM),
+        HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
+    ]
+    response = await llm.ainvoke(messages)
+    issues = _parse_issues(response.content, "bug")
+    logger.info("bug_check.done", count=len(issues))
+    return {"issues": issues}
+
+
+# ── Node: Security Check ───────────────────────────────────────────────────────
+
+SECURITY_SYSTEM = """You are a security code auditor (OWASP expert). Check for: SQL injection, XSS, insecure deserialization, hardcoded secrets/credentials, insecure random, path traversal, SSRF, broken auth, unvalidated input, and other OWASP Top 10 issues.
+
+Respond ONLY with a valid JSON array (no markdown, no explanation). Each element:
+{
+  "severity": "critical|high|medium|low",
+  "line_start": "line number or null",
+  "line_end": "line number or null",
+  "title": "short title",
+  "description": "security risk explanation",
+  "suggestion": "how to remediate",
+  "code_snippet": "relevant code snippet"
+}
+
+If no issues found, return [].
+"""
+
+async def security_check(state: ReviewState) -> dict:
+    llm = get_llm()
+    messages = [
+        SystemMessage(content=SECURITY_SYSTEM),
+        HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
+    ]
+    response = await llm.ainvoke(messages)
+    issues = _parse_issues(response.content, "security")
+    logger.info("security_check.done", count=len(issues))
+    return {"issues": issues}
+
+
+# ── Node: Style Check ──────────────────────────────────────────────────────────
+
+STYLE_SYSTEM = """You are a code style and maintainability reviewer. Check for: naming conventions, function length, code duplication (DRY), missing documentation, overly complex logic, poor abstractions, and language-specific best practices.
+
+Respond ONLY with a valid JSON array (no markdown, no explanation). Each element:
+{
+  "severity": "medium|low|info",
+  "line_start": "line number or null",
+  "line_end": "line number or null",
+  "title": "short title",
+  "description": "style issue explanation",
+  "suggestion": "how to improve",
+  "code_snippet": "relevant code snippet"
+}
+
+If no issues found, return [].
+"""
+
+async def style_check(state: ReviewState) -> dict:
+    llm = get_llm()
+    messages = [
+        SystemMessage(content=STYLE_SYSTEM),
+        HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
+    ]
+    response = await llm.ainvoke(messages)
+    issues = _parse_issues(response.content, "style")
+    logger.info("style_check.done", count=len(issues))
+    return {"issues": issues}
+
+
+# ── Node: Performance Check ────────────────────────────────────────────────────
+
+PERF_SYSTEM = """You are a performance optimization expert. Check for: N+1 queries, unnecessary loops, missing caching, inefficient data structures, blocking I/O in async code, memory leaks, and algorithmic complexity issues.
+
+Respond ONLY with a valid JSON array (no markdown, no explanation). Each element:
+{
+  "severity": "high|medium|low",
+  "line_start": "line number or null",
+  "line_end": "line number or null",
+  "title": "short title",
+  "description": "performance issue explanation",
+  "suggestion": "how to optimize",
+  "code_snippet": "relevant code snippet"
+}
+
+If no issues found, return [].
+"""
+
+async def performance_check(state: ReviewState) -> dict:
+    llm = get_llm()
+    messages = [
+        SystemMessage(content=PERF_SYSTEM),
+        HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
+    ]
+    response = await llm.ainvoke(messages)
+    issues = _parse_issues(response.content, "performance")
+    logger.info("performance_check.done", count=len(issues))
+    return {"issues": issues}
+
+
+# ── Node: Aggregate ────────────────────────────────────────────────────────────
+
+async def aggregate(state: ReviewState) -> dict:
+    return {"status": "complete"}
+
+
+# ── Build Graph ────────────────────────────────────────────────────────────────
+
+def build_review_graph() -> StateGraph:
+    graph = StateGraph(ReviewState)
+
+    graph.add_node("analyze_structure", analyze_structure)
+    graph.add_node("bug_check", bug_check)
+    graph.add_node("security_check", security_check)
+    graph.add_node("style_check", style_check)
+    graph.add_node("performance_check", performance_check)
+    graph.add_node("aggregate", aggregate)
+
+    graph.set_entry_point("analyze_structure")
+
+    # After structure analysis, fan out to all 4 checks in parallel
+    graph.add_edge("analyze_structure", "bug_check")
+    graph.add_edge("analyze_structure", "security_check")
+    graph.add_edge("analyze_structure", "style_check")
+    graph.add_edge("analyze_structure", "performance_check")
+
+    # All checks feed into aggregate
+    graph.add_edge("bug_check", "aggregate")
+    graph.add_edge("security_check", "aggregate")
+    graph.add_edge("style_check", "aggregate")
+    graph.add_edge("performance_check", "aggregate")
+
+    graph.add_edge("aggregate", END)
+
+    return graph.compile()
+
+
+# Singleton compiled graph
+review_graph = build_review_graph()
+
+
+async def run_review(review_id: str, code: str, language: str) -> ReviewState:
+    """Run the full LangGraph review pipeline."""
+    initial_state: ReviewState = {
+        "code": code,
+        "language": language,
+        "review_id": review_id,
+        "structure_summary": "",
+        "issues": [],
+        "status": "running",
+        "error": "",
+    }
+    result = await review_graph.ainvoke(initial_state)
+    return result
+
+
+# ── SSE Streaming ──────────────────────────────────────────────────────────────
+
+# Node display names for the SSE stream (what the frontend shows)
+_NODE_LABELS = {
+    "analyze_structure": "Analyzing structure",
+    "bug_check": "Checking for bugs",
+    "security_check": "Auditing security",
+    "style_check": "Reviewing style",
+    "performance_check": "Profiling performance",
+    "aggregate": "Aggregating results",
+}
+
+# System prompts keyed by node (reused for streaming variant)
+_NODE_SYSTEMS = {
+    "bug_check": BUG_SYSTEM,
+    "security_check": SECURITY_SYSTEM,
+    "style_check": STYLE_SYSTEM,
+    "performance_check": PERF_SYSTEM,
+}
+
+
+async def _stream_node(node: str, code: str, language: str):
+    """
+    Stream tokens from a single review node. Yields dicts:
+      {"type": "node_start", "node": node, "label": label}
+      {"type": "token",      "node": node, "text": chunk}
+      {"type": "node_done",  "node": node, "issue_count": n}
+    """
+    llm = ChatGroq(
+        api_key=settings.GROQ_API_KEY,
+        model=settings.GROQ_MODEL,
+        temperature=0.1,
+        streaming=True,
+    )
+    system = _NODE_SYSTEMS.get(node, "")
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=f"Language: {language}\n\n```\n{code}\n```"),
+    ]
+
+    label = _NODE_LABELS.get(node, node)
+    yield {"type": "node_start", "node": node, "label": label}
+
+    full_text = ""
+    async for chunk in llm.astream(messages):
+        token = chunk.content
+        if token:
+            full_text += token
+            yield {"type": "token", "node": node, "text": token}
+
+    issues = _parse_issues(full_text, node.replace("_check", ""))
+    yield {"type": "node_done", "node": node, "issue_count": len(issues), "issues": issues}
+
+
+async def stream_review_progress(review_id: str, code: str, language: str):
+    """
+    Async generator for SSE endpoint. Streams all nodes concurrently,
+    emitting tokens in arrival order so the UI feels live for all 4 checks.
+
+    Sequence:
+      1. analyze_structure  (sequential — other nodes depend on the summary)
+      2. bug / security / style / performance  (concurrent streams interleaved)
+      3. complete
+    """
+    # Step 1: structure analysis (not streamed, fast)
+    llm = ChatGroq(
+        api_key=settings.GROQ_API_KEY,
+        model=settings.GROQ_MODEL,
+        temperature=0.1,
+    )
+    yield {"type": "node_start", "node": "analyze_structure", "label": _NODE_LABELS["analyze_structure"]}
+    struct_resp = await llm.ainvoke([
+        SystemMessage(content="You are a senior software engineer. Briefly summarize what this code does in 2-3 sentences. Be concise."),
+        HumanMessage(content=f"Language: {language}\n\n```\n{code}\n```"),
+    ])
+    yield {"type": "node_done", "node": "analyze_structure", "issue_count": 0, "summary": struct_resp.content}
+
+    # Step 2: fan out 4 checks concurrently, merge token streams via asyncio.Queue
+    import asyncio
+    queue: asyncio.Queue = asyncio.Queue()
+    parallel_nodes = ["bug_check", "security_check", "style_check", "performance_check"]
+    total_issues = 0
+    all_issues = []
+
+    async def drain_node(node: str):
+        async for event in _stream_node(node, code, language):
+            await queue.put(event)
+        await queue.put({"type": "_node_finished_sentinel", "node": node})
+
+    tasks = [asyncio.create_task(drain_node(n)) for n in parallel_nodes]
+    finished = 0
+
+    while finished < len(parallel_nodes):
+        event = await queue.get()
+        if event.get("type") == "_node_finished_sentinel":
+            finished += 1
+            continue
+        if event.get("type") == "node_done":
+            total_issues += event.get("issue_count", 0)
+            all_issues.extend(event.get("issues", []))
+        yield event
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    yield {"type": "complete", "issue_count": total_issues, "issues": all_issues}
