@@ -11,7 +11,7 @@ export function useReviewSocket(reviewId: string | null) {
   const ws = useRef<WebSocket | null>(null);
   const { token } = useAuthStore();
   const { appendIssues, setActiveUsers, addCommentLocal, setReviewStatus } = useReviewStore();
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const connect = useCallback(() => {
     if (!reviewId || !token) return;
