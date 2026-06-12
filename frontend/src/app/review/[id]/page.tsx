@@ -105,13 +105,23 @@ export default function ReviewPage() {
     }
   }, [isHydrated, token, id]);
 
-  // Auto-start SSE stream when review is running
-  useEffect(() => {
+   // Auto-start SSE stream when review is running
+      useEffect(() => {
     if (activeReview?.status === "running" && !streamStarted && token) {
       setStreamStarted(true);
       startStream();
-    }
-  }, [activeReview?.status, streamStarted, token]);
+
+    // Timeout after 3 minutes — mark as error if still running
+    const timeout = setTimeout(() => {
+      if (activeReview?.status === "running") {
+        setReviewStatus("error");
+        toast.error("Review timed out. Please try again.");
+      }
+    }, 3 * 60 * 1000);
+
+    return () => clearTimeout(timeout);
+  }
+}, [activeReview?.status, streamStarted, token]);
 
   // When SSE surfaces issues before WebSocket fires, show them immediately
   useEffect(() => {
