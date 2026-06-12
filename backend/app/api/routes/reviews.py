@@ -112,7 +112,8 @@ async def _run_agent_and_persist(review_id: str, code: str, language: str, db_ur
 # ── POST /api/reviews — paste code ────────────────────────────────────────────
 
 @router.post("", response_model=ReviewOut, status_code=201)
-@limiter.limit("10/minute")
+@limiter.limit("3/minute")
+@limiter.limit("20/day")
 async def create_review(
     request: Request,
     body: ReviewCreate,
@@ -199,7 +200,8 @@ async def _fetch_pr_diff(owner: str, repo: str, pr_number: int, github_token: st
 
 
 @router.post("/from-pr", response_model=ReviewOut, status_code=201)
-@limiter.limit("5/minute")
+@limiter.limit("2/minute")
+@limiter.limit("20/day")
 async def create_review_from_pr(
     request: Request,
     body: PRReviewCreate,
