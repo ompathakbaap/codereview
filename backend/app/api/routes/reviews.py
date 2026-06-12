@@ -178,7 +178,7 @@ async def _fetch_pr_diff(owner: str, repo: str, pr_number: int, github_token: st
         meta = meta_resp.json()
 
         # Fetch the actual diff
-        diff_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+        diff_url = f"https://github.com/{owner}/{repo}/pull/{pr_number}.diff"
         diff_resp = await client.get(diff_url, headers=headers)
         diff_resp.raise_for_status()
         diff_text = diff_resp.text
