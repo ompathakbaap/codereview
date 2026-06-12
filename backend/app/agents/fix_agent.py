@@ -26,7 +26,7 @@ logger = structlog.get_logger()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def get_llm(streaming: bool = False) -> ChatGroq:
+def get_llm(streaming: bool = False, max_tokens: int | None = None) -> ChatGroq:
     return ChatGroq(
         api_key=settings.GROQ_API_KEY,
         model=settings.GROQ_MODEL,
@@ -34,6 +34,7 @@ def get_llm(streaming: bool = False) -> ChatGroq:
         streaming=streaming,
         max_retries=0,
         request_timeout=30,
+        max_tokens=max_tokens,
     )
 
 
@@ -131,7 +132,8 @@ async def stream_fix_progress(review_id: str, code: str, language: str, issues: 
     import asyncio
 
     llm = get_llm()
-    llm_stream = get_llm(streaming=True)
+    llm_stream = get_llm(streaming=True)              # for full code generation — no cap needed
+    llm_explain = get_llm(streaming=True, max_tokens=300)  # for explanations — keep them concise
 
     yield {"type": "fix_start", "issue_count": len(issues)}
 
@@ -208,13 +210,13 @@ Output ONLY the complete corrected code:"""
 
         yield {"type": "explain_start", "issue_id": issue_id}
 
+# Use only the relevant snippet instead of the full file to save tokens
+        snippet = issue.get("code_snippet") or "(snippet not available)"
+
         explain_prompt = f"""Language: {language}
 
-Original code:
-{code}
-
-Fixed code:
-{fixed_code}
+Relevant original code snippet:
+{snippet}
 
 Issue being explained:
 Title: {issue.get("title")}
@@ -224,7 +226,7 @@ Description: {issue.get("description")}
 Original suggestion: {issue.get("suggestion", "N/A")}
 Fix applied: {plan_item.get("fix_summary")}
 
-Explain the fix:"""
+Explain what was wrong with this snippet and how the fix addresses it. Keep it concise."""
 
         explanation_parts = []
         async for chunk in llm_stream.astream([
