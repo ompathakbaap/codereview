@@ -1,25 +1,28 @@
 """
 LangGraph-powered AI Code Review Agent
-Uses Groq (free tier, no credit card) with llama-3.3-70b-versatile.
+
+Supports two backends (selected via environment variables):
+  - Groq  (default): set GROQ_API_KEY + GROQ_MODEL
+  - Ollama (local):  set OLLAMA_BASE_URL (e.g. http://localhost:11434) + OLLAMA_MODEL
 
 Graph flow:
-  START → analyze_structure → [bug_check, security_check, style_check, perf_check] → aggregate → END
-
+  START -> analyze_structure -> [bug_check, security_check, style_check, perf_check] -> aggregate -> END
 Each node runs in parallel; results are merged in aggregate.
 """
 import json
 import re
+import asyncio
 from typing import TypedDict, Annotated, List
 from langgraph.graph import StateGraph, END
-from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.language_models.chat_models import BaseChatModel
 from app.core.config import settings
 import structlog
 
 logger = structlog.get_logger()
 
 
-# ── State ──────────────────────────────────────────────────────────────────────
+# -- State --------------------------------------------------------------------
 
 def merge_issues(a: list, b: list) -> list:
     return a + b
@@ -35,21 +38,57 @@ class ReviewState(TypedDict):
     error: str
 
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
+# -- LLM factory --------------------------------------------------------------
 
-def get_llm() -> ChatGroq:
-    return ChatGroq(
-        api_key=settings.GROQ_API_KEY,
-        model=settings.GROQ_MODEL,
-        temperature=0.1,
-    )
+def get_llm(streaming: bool = False) -> BaseChatModel:
+    """
+    Returns ChatOllama if OLLAMA_BASE_URL is configured, else ChatGroq.
+    To use Ollama: set OLLAMA_BASE_URL=http://localhost:11434 and OLLAMA_MODEL=llama3.2
+    """
+    if getattr(settings, "OLLAMA_BASE_URL", None):
+        from langchain_ollama import ChatOllama
+        model = getattr(settings, "OLLAMA_MODEL", "llama3.2")
+        logger.info("llm.backend", backend="ollama", model=model)
+        return ChatOllama(
+            base_url=settings.OLLAMA_BASE_URL,
+            model=model,
+            temperature=0.1,
+        )
+    else:
+        from langchain_groq import ChatGroq
+        logger.info("llm.backend", backend="groq", model=settings.GROQ_MODEL)
+        return ChatGroq(
+            api_key=settings.GROQ_API_KEY,
+            model=settings.GROQ_MODEL,
+            temperature=0.1,
+            streaming=streaming,
+        )
 
+
+# -- Retry wrapper ------------------------------------------------------------
+
+async def _invoke_with_retry(llm: BaseChatModel, messages: list, max_retries: int = 3):
+    """Invoke LLM with exponential backoff on 429 rate limit errors."""
+    for attempt in range(max_retries):
+        try:
+            return await llm.ainvoke(messages)
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate_limit" in err.lower():
+                wait = 2 ** attempt * 5  # 5s, 10s, 20s
+                logger.warning("llm.rate_limited", attempt=attempt + 1, wait_seconds=wait)
+                await asyncio.sleep(wait)
+            else:
+                raise
+    raise Exception("Service busy — rate limit exceeded after retries. Please try again in a few minutes.")
+
+
+# -- Issue parser -------------------------------------------------------------
 
 def _parse_issues(raw: str, category: str) -> list[dict]:
     """Safely parse JSON array of issues from LLM output."""
     try:
         clean = raw.strip()
-        # Strip markdown code fences if present
         clean = re.sub(r"```json\s*|```\s*", "", clean).strip()
         data = json.loads(clean)
         issues = data if isinstance(data, list) else data.get("issues", [])
@@ -61,23 +100,19 @@ def _parse_issues(raw: str, category: str) -> list[dict]:
         return []
 
 
-# ── Node: Analyze Structure ────────────────────────────────────────────────────
+# -- Node: Analyze Structure --------------------------------------------------
 
 async def analyze_structure(state: ReviewState) -> dict:
-    llm = ChatGroq(
-        api_key=settings.GROQ_API_KEY,
-        model=settings.GROQ_MODEL,
-        temperature=0.1,
-    )
+    llm = get_llm()
     messages = [
         SystemMessage(content="You are a senior software engineer. Briefly summarize what this code does in 2-3 sentences. Be concise."),
         HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
     ]
-    response = await llm.ainvoke(messages)
+    response = await _invoke_with_retry(llm, messages)
     return {"structure_summary": response.content, "status": "running"}
 
 
-# ── Node: Bug Check ────────────────────────────────────────────────────────────
+# -- Node: Bug Check ----------------------------------------------------------
 
 BUG_SYSTEM = """You are a code bug detector. Analyze the code for bugs, logic errors, null pointer issues, off-by-one errors, exception handling gaps, and incorrect assumptions.
 
@@ -101,13 +136,13 @@ async def bug_check(state: ReviewState) -> dict:
         SystemMessage(content=BUG_SYSTEM),
         HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
     ]
-    response = await llm.ainvoke(messages)
+    response = await _invoke_with_retry(llm, messages)
     issues = _parse_issues(response.content, "bug")
     logger.info("bug_check.done", count=len(issues))
     return {"issues": issues}
 
 
-# ── Node: Security Check ───────────────────────────────────────────────────────
+# -- Node: Security Check -----------------------------------------------------
 
 SECURITY_SYSTEM = """You are a security code auditor (OWASP expert). Check for: SQL injection, XSS, insecure deserialization, hardcoded secrets/credentials, insecure random, path traversal, SSRF, broken auth, unvalidated input, and other OWASP Top 10 issues.
 
@@ -131,13 +166,13 @@ async def security_check(state: ReviewState) -> dict:
         SystemMessage(content=SECURITY_SYSTEM),
         HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
     ]
-    response = await llm.ainvoke(messages)
+    response = await _invoke_with_retry(llm, messages)
     issues = _parse_issues(response.content, "security")
     logger.info("security_check.done", count=len(issues))
     return {"issues": issues}
 
 
-# ── Node: Style Check ──────────────────────────────────────────────────────────
+# -- Node: Style Check --------------------------------------------------------
 
 STYLE_SYSTEM = """You are a code style and maintainability reviewer. Check for: naming conventions, function length, code duplication (DRY), missing documentation, overly complex logic, poor abstractions, and language-specific best practices.
 
@@ -161,13 +196,13 @@ async def style_check(state: ReviewState) -> dict:
         SystemMessage(content=STYLE_SYSTEM),
         HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
     ]
-    response = await llm.ainvoke(messages)
+    response = await _invoke_with_retry(llm, messages)
     issues = _parse_issues(response.content, "style")
     logger.info("style_check.done", count=len(issues))
     return {"issues": issues}
 
 
-# ── Node: Performance Check ────────────────────────────────────────────────────
+# -- Node: Performance Check --------------------------------------------------
 
 PERF_SYSTEM = """You are a performance optimization expert. Check for: N+1 queries, unnecessary loops, missing caching, inefficient data structures, blocking I/O in async code, memory leaks, and algorithmic complexity issues.
 
@@ -191,19 +226,19 @@ async def performance_check(state: ReviewState) -> dict:
         SystemMessage(content=PERF_SYSTEM),
         HumanMessage(content=f"Language: {state['language']}\n\n```\n{state['code']}\n```"),
     ]
-    response = await llm.ainvoke(messages)
+    response = await _invoke_with_retry(llm, messages)
     issues = _parse_issues(response.content, "performance")
     logger.info("performance_check.done", count=len(issues))
     return {"issues": issues}
 
 
-# ── Node: Aggregate ────────────────────────────────────────────────────────────
+# -- Node: Aggregate ----------------------------------------------------------
 
 async def aggregate(state: ReviewState) -> dict:
     return {"status": "complete"}
 
 
-# ── Build Graph ────────────────────────────────────────────────────────────────
+# -- Build Graph --------------------------------------------------------------
 
 def build_review_graph() -> StateGraph:
     graph = StateGraph(ReviewState)
@@ -217,13 +252,11 @@ def build_review_graph() -> StateGraph:
 
     graph.set_entry_point("analyze_structure")
 
-    # After structure analysis, fan out to all 4 checks in parallel
     graph.add_edge("analyze_structure", "bug_check")
     graph.add_edge("analyze_structure", "security_check")
     graph.add_edge("analyze_structure", "style_check")
     graph.add_edge("analyze_structure", "performance_check")
 
-    # All checks feed into aggregate
     graph.add_edge("bug_check", "aggregate")
     graph.add_edge("security_check", "aggregate")
     graph.add_edge("style_check", "aggregate")
@@ -253,9 +286,8 @@ async def run_review(review_id: str, code: str, language: str) -> ReviewState:
     return result
 
 
-# ── SSE Streaming ──────────────────────────────────────────────────────────────
+# -- SSE Streaming ------------------------------------------------------------
 
-# Node display names for the SSE stream (what the frontend shows)
 _NODE_LABELS = {
     "analyze_structure": "Analyzing structure",
     "bug_check": "Checking for bugs",
@@ -265,7 +297,6 @@ _NODE_LABELS = {
     "aggregate": "Aggregating results",
 }
 
-# System prompts keyed by node (reused for streaming variant)
 _NODE_SYSTEMS = {
     "bug_check": BUG_SYSTEM,
     "security_check": SECURITY_SYSTEM,
@@ -276,17 +307,10 @@ _NODE_SYSTEMS = {
 
 async def _stream_node(node: str, code: str, language: str):
     """
-    Stream tokens from a single review node. Yields dicts:
-      {"type": "node_start", "node": node, "label": label}
-      {"type": "token",      "node": node, "text": chunk}
-      {"type": "node_done",  "node": node, "issue_count": n}
+    Stream tokens from a single review node.
+    Falls back gracefully on rate limit errors.
     """
-    llm = ChatGroq(
-        api_key=settings.GROQ_API_KEY,
-        model=settings.GROQ_MODEL,
-        temperature=0.1,
-        streaming=True,
-    )
+    llm = get_llm(streaming=True)
     system = _NODE_SYSTEMS.get(node, "")
     messages = [
         SystemMessage(content=system),
@@ -297,11 +321,21 @@ async def _stream_node(node: str, code: str, language: str):
     yield {"type": "node_start", "node": node, "label": label}
 
     full_text = ""
-    async for chunk in llm.astream(messages):
-        token = chunk.content
-        if token:
-            full_text += token
-            yield {"type": "token", "node": node, "text": token}
+
+    try:
+        async for chunk in llm.astream(messages):
+            token = chunk.content
+            if token:
+                full_text += token
+                yield {"type": "token", "node": node, "text": token}
+    except Exception as e:
+        if "429" in str(e) or "rate_limit" in str(e).lower():
+            # Retry without streaming on rate limit
+            response = await _invoke_with_retry(get_llm(), messages)
+            full_text = response.content
+            yield {"type": "token", "node": node, "text": full_text}
+        else:
+            raise
 
     issues = _parse_issues(full_text, node.replace("_check", ""))
     yield {"type": "node_done", "node": node, "issue_count": len(issues), "issues": issues}
@@ -309,29 +343,19 @@ async def _stream_node(node: str, code: str, language: str):
 
 async def stream_review_progress(review_id: str, code: str, language: str):
     """
-    Async generator for SSE endpoint. Streams all nodes concurrently,
-    emitting tokens in arrival order so the UI feels live for all 4 checks.
-
-    Sequence:
-      1. analyze_structure  (sequential — other nodes depend on the summary)
-      2. bug / security / style / performance  (concurrent streams interleaved)
-      3. complete
+    Async generator for SSE endpoint.
+    Streams all nodes concurrently, emitting tokens in arrival order.
     """
-    # Step 1: structure analysis (not streamed, fast)
-    llm = ChatGroq(
-        api_key=settings.GROQ_API_KEY,
-        model=settings.GROQ_MODEL,
-        temperature=0.1,
-    )
+    # Step 1: structure analysis
+    llm = get_llm()
     yield {"type": "node_start", "node": "analyze_structure", "label": _NODE_LABELS["analyze_structure"]}
-    struct_resp = await llm.ainvoke([
+    struct_resp = await _invoke_with_retry(llm, [
         SystemMessage(content="You are a senior software engineer. Briefly summarize what this code does in 2-3 sentences. Be concise."),
         HumanMessage(content=f"Language: {language}\n\n```\n{code}\n```"),
     ])
     yield {"type": "node_done", "node": "analyze_structure", "issue_count": 0, "summary": struct_resp.content}
 
-    # Step 2: fan out 4 checks concurrently, merge token streams via asyncio.Queue
-    import asyncio
+    # Step 2: parallel checks
     queue: asyncio.Queue = asyncio.Queue()
     parallel_nodes = ["bug_check", "security_check", "style_check", "performance_check"]
     total_issues = 0
