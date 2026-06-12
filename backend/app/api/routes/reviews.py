@@ -112,8 +112,7 @@ async def _run_agent_and_persist(review_id: str, code: str, language: str, db_ur
 # ── POST /api/reviews — paste code ────────────────────────────────────────────
 
 @router.post("", response_model=ReviewOut, status_code=201)
-@limiter.limit("3/minute")
-@limiter.limit("20/day")
+@limiter.limit("50/day")
 async def create_review(
     request: Request,
     body: ReviewCreate,
@@ -162,7 +161,7 @@ async def _fetch_pr_diff(owner: str, repo: str, pr_number: int, github_token: st
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         # Get PR metadata for language detection
         meta_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
         meta_headers = {"Accept": "application/vnd.github.v3+json"}
@@ -200,8 +199,7 @@ async def _fetch_pr_diff(owner: str, repo: str, pr_number: int, github_token: st
 
 
 @router.post("/from-pr", response_model=ReviewOut, status_code=201)
-@limiter.limit("2/minute")
-@limiter.limit("20/day")
+@limiter.limit("50/day")
 async def create_review_from_pr(
     request: Request,
     body: PRReviewCreate,
