@@ -4,7 +4,7 @@ import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft, Sparkles, GitCompare, Loader2, CheckCircle,
   AlertCircle, Copy, Check, Play, RotateCcw, Bug, Shield,
-  Palette, Zap, ChevronRight, FileCode,
+  Palette, Zap, ChevronRight, FileCode, Download,
 } from "lucide-react";
 import { useAuthStore } from "@/store";
 import { useFixStream } from "@/hooks/useFixStream";
@@ -14,7 +14,7 @@ import api from "@/lib/api";
 import toast from "react-hot-toast";
 import { motion, AnimatePresence } from "framer-motion";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+// ── Types ───────────────────────────────────────────────────────────────────
 
 interface ReviewInfo {
   id: string;
@@ -35,7 +35,37 @@ interface ReviewInfo {
   }>;
 }
 
-// ── Phase stepper ─────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function getFileExt(language?: string): string {
+  const map: Record<string, string> = {
+    python: "py",
+    javascript: "js",
+    typescript: "ts",
+    go: "go",
+    java: "java",
+    rust: "rs",
+    cpp: "cpp",
+    c: "c",
+    csharp: "cs",
+    ruby: "rb",
+    php: "php",
+  };
+  return map[language ?? ""] ?? "txt";
+}
+
+function downloadFile(content: string, language?: string) {
+  const ext = getFileExt(language);
+  const blob = new Blob([content], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `fixed.${ext}`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ── Phase stepper ────────────────────────────────────────────────────────────
 
 const PHASES = [
   { key: "planning", label: "Planning fixes", icon: Sparkles },
@@ -46,15 +76,12 @@ const PHASES = [
 
 function PhaseStepper({ phase }: { phase: string }) {
   const phaseIndex = PHASES.findIndex((p) => p.key === phase);
-
   return (
     <div className="flex items-center gap-0 overflow-x-auto py-1">
       {PHASES.map((p, i) => {
         const Icon = p.icon;
         const done = i < phaseIndex;
         const active = i === phaseIndex;
-        const future = i > phaseIndex;
-
         return (
           <div key={p.key} className="flex items-center">
             <div
@@ -85,7 +112,7 @@ function PhaseStepper({ phase }: { phase: string }) {
   );
 }
 
-// ── Stats bar ─────────────────────────────────────────────────────────────────
+// ── Stats bar ────────────────────────────────────────────────────────────────
 
 function StatsBar({ lineChanges, issueCount }: {
   lineChanges: { total_added: number; total_removed: number } | null;
@@ -101,7 +128,7 @@ function StatsBar({ lineChanges, issueCount }: {
   );
 }
 
-// ── Copy button ───────────────────────────────────────────────────────────────
+// ── Copy button ──────────────────────────────────────────────────────────────
 
 function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
   const [copied, setCopied] = useState(false);
@@ -121,7 +148,7 @@ function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) 
   );
 }
 
-// ── Code panel ────────────────────────────────────────────────────────────────
+// ── Code panel ───────────────────────────────────────────────────────────────
 
 function CodePanel({ title, code, language, badge }: {
   title: string;
@@ -148,7 +175,57 @@ function CodePanel({ title, code, language, badge }: {
   );
 }
 
-// ── Main Page ─────────────────────────────────────────────────────────────────
+// ── Confirm Modal ────────────────────────────────────────────────────────────
+
+function ConfirmModal({
+  issueCount,
+  onConfirm,
+  onCancel,
+}: {
+  issueCount: number;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="bg-surface border border-border rounded-2xl p-6 max-w-sm w-full mx-4 shadow-2xl"
+      >
+        <div className="w-12 h-12 rounded-xl bg-accent/10 border border-accent/20 flex items-center justify-center mx-auto mb-4">
+          <Sparkles className="w-6 h-6 text-accent" />
+        </div>
+        <h3 className="text-base font-semibold text-white text-center mb-2">Run Fix-It?</h3>
+        <p className="text-sm text-gray-400 text-center mb-1">
+          This will use{" "}
+          <span className="text-white font-medium">1 of your 50 daily requests</span> to generate
+          fixes for{" "}
+          <span className="text-white font-medium">{issueCount} issue{issueCount !== 1 ? "s" : ""}</span>.
+        </p>
+        <p className="text-xs text-gray-600 text-center mb-6">
+          Powered by Groq · usually takes 10–20 seconds
+        </p>
+        <div className="flex gap-3">
+          <button
+            onClick={onCancel}
+            className="flex-1 px-4 py-2.5 rounded-xl border border-border text-sm text-gray-400 hover:text-white hover:border-gray-600 transition-all"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="flex-1 px-4 py-2.5 rounded-xl bg-accent text-bg text-sm font-semibold hover:bg-accent/90 transition-all glow-accent"
+          >
+            Run Fix-It
+          </button>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+// ── Main Page ────────────────────────────────────────────────────────────────
 
 export default function FixItPage() {
   const { id } = useParams<{ id: string }>();
@@ -159,6 +236,7 @@ export default function FixItPage() {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<"diff" | "side-by-side" | "fixed">("diff");
   const [started, setStarted] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
 
   const {
     phase, plan, fixTokens, fixedCode, diff, lineChanges,
@@ -177,6 +255,7 @@ export default function FixItPage() {
   }, [token, id]);
 
   const handleStart = () => {
+    setShowConfirm(false);
     setStarted(true);
     start();
   };
@@ -190,16 +269,16 @@ export default function FixItPage() {
   const isDone = phase === "complete";
   const isError = phase === "error";
 
-  // Build a map of plan items by issue_id for quick lookup
   const planMap = Object.fromEntries(plan.map((p) => [p.issue_id, p]));
-
-  // Live code: show streaming tokens during generation, then final fixed code
   const displayCode = fixedCode || fixTokens;
+  const fileExt = getFileExt(reviewInfo?.language);
+  const originalFilename = `original.${fileExt}`;
+  const fixedFilename = `fixed.${fileExt}`;
 
   return (
     <div className="min-h-screen bg-bg flex flex-col">
 
-      {/* ── Top bar ────────────────────────────────────────────────────────────── */}
+      {/* ── Top bar ──────────────────────────────────────────────────────────── */}
       <header className="border-b border-border bg-surface/50 backdrop-blur sticky top-0 z-20">
         <div className="px-4 h-14 flex items-center gap-4">
           <button
@@ -224,16 +303,14 @@ export default function FixItPage() {
             </div>
           </div>
 
-          {/* Stats */}
           {isDone && (
             <StatsBar lineChanges={lineChanges} issueCount={issueCount} />
           )}
 
-          {/* Controls */}
           <div className="flex items-center gap-2">
             {!started && !isRunning && !isDone && !isError && (
               <button
-                onClick={handleStart}
+                onClick={() => setShowConfirm(true)}
                 disabled={loading || reviewInfo?.status !== "complete"}
                 className="flex items-center gap-2 px-4 py-2 rounded-xl bg-accent text-bg text-sm font-semibold hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed transition-all glow-accent"
               >
@@ -257,12 +334,20 @@ export default function FixItPage() {
               </button>
             )}
             {isDone && (
-              <CopyButton text={fixedCode} label="Copy fixed code" />
+              <div className="flex items-center gap-2">
+                <CopyButton text={fixedCode} label="Copy" />
+                <button
+                  onClick={() => downloadFile(fixedCode, reviewInfo?.language)}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-mono text-gray-400 hover:text-white border border-border hover:border-gray-600 transition-all"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download {fixedFilename}
+                </button>
+              </div>
             )}
           </div>
         </div>
 
-        {/* Phase stepper — shown while running or done */}
         {(isRunning || isDone) && (
           <div className="px-4 pb-2.5 border-t border-border/50 pt-2">
             <PhaseStepper phase={phase} />
@@ -270,7 +355,7 @@ export default function FixItPage() {
         )}
       </header>
 
-      {/* ── Content ─────────────────────────────────────────────────────────────── */}
+      {/* ── Content ──────────────────────────────────────────────────────────── */}
       {loading ? (
         <div className="flex items-center justify-center flex-1">
           <Loader2 className="w-6 h-6 text-accent animate-spin" />
@@ -301,10 +386,9 @@ export default function FixItPage() {
               Powered by Groq · {reviewInfo?.issues?.length ?? 0} issues to address
             </p>
 
-            {/* Issue preview */}
             {reviewInfo && reviewInfo.issues.length > 0 && (
               <div className="mb-8 text-left space-y-2 max-h-48 overflow-y-auto">
-                {reviewInfo.issues.map((issue, i) => {
+                {reviewInfo.issues.map((issue) => {
                   const icons: Record<string, React.ReactNode> = {
                     bug: <Bug className="w-3.5 h-3.5 text-red-400" />,
                     security: <Shield className="w-3.5 h-3.5 text-orange-400" />,
@@ -329,7 +413,7 @@ export default function FixItPage() {
               </div>
             ) : (
               <button
-                onClick={handleStart}
+                onClick={() => setShowConfirm(true)}
                 className="flex items-center gap-2 px-8 py-3 rounded-2xl bg-accent text-bg text-base font-bold hover:bg-accent/90 transition-all mx-auto glow-accent"
               >
                 <Play className="w-4 h-4" />
@@ -345,7 +429,6 @@ export default function FixItPage() {
           {/* Left: code / diff area */}
           <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
 
-            {/* View switcher — shown once we have some diff/code */}
             {(displayCode || diff) && (
               <div className="flex items-center gap-1 px-4 py-2 border-b border-border bg-surface/30">
                 {[
@@ -375,7 +458,6 @@ export default function FixItPage() {
               </div>
             )}
 
-            {/* Code display area */}
             <div className="flex-1 overflow-hidden">
               <AnimatePresence mode="wait">
                 {view === "diff" ? (
@@ -402,13 +484,13 @@ export default function FixItPage() {
                 ) : view === "side-by-side" ? (
                   <motion.div key="side" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="h-full grid grid-cols-2 divide-x divide-border">
                     <CodePanel
-                      title="original.ts"
+                      title={originalFilename}
                       code={reviewInfo?.code ?? ""}
                       language={reviewInfo?.language ?? ""}
                       badge={<span className="text-xs text-gray-600 font-mono ml-1">original</span>}
                     />
                     <CodePanel
-                      title="fixed.ts"
+                      title={fixedFilename}
                       code={displayCode}
                       language={reviewInfo?.language ?? ""}
                       badge={
@@ -421,7 +503,7 @@ export default function FixItPage() {
                 ) : (
                   <motion.div key="fixed" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="h-full flex flex-col">
                     <CodePanel
-                      title={`fixed.${reviewInfo?.language ?? "code"}`}
+                      title={fixedFilename}
                       code={displayCode}
                       language={reviewInfo?.language ?? ""}
                     />
@@ -447,7 +529,6 @@ export default function FixItPage() {
             </div>
 
             <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
-              {/* Planning phase — show skeleton */}
               {phase === "planning" && (
                 <div className="text-center py-12">
                   <Sparkles className="w-7 h-7 text-accent mx-auto mb-3 animate-pulse" />
@@ -455,7 +536,6 @@ export default function FixItPage() {
                 </div>
               )}
 
-              {/* Issues with fix cards */}
               {reviewInfo?.issues.map((issue, index) => {
                 const planItem = planMap[issue.id];
                 const explanation = explanations[issue.id];
@@ -463,7 +543,6 @@ export default function FixItPage() {
                 const isThisExplaining = activeExplainId === issue.id;
                 const isThisFixed = !!explanation;
 
-                // Only show issues that are either in the plan or have already been explained
                 if (!planItem && phase === "planning") return null;
 
                 return (
@@ -480,7 +559,6 @@ export default function FixItPage() {
                 );
               })}
 
-              {/* Complete state CTA */}
               {isDone && (
                 <motion.div
                   initial={{ opacity: 0, y: 12 }}
@@ -489,15 +567,31 @@ export default function FixItPage() {
                 >
                   <CheckCircle className="w-8 h-8 text-green-400 mx-auto mb-2 opacity-80" />
                   <p className="text-sm text-green-300 font-medium mb-1">All fixes applied</p>
-                  <p className="text-xs text-gray-500">Copy the fixed code above to use it in your project.</p>
-                  <div className="mt-3">
+                  <p className="text-xs text-gray-500 mb-3">Copy or download the fixed code.</p>
+                  <div className="flex items-center justify-center gap-2 flex-wrap">
                     <CopyButton text={fixedCode} label="Copy fixed code" />
+                    <button
+                      onClick={() => downloadFile(fixedCode, reviewInfo?.language)}
+                      className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-mono text-gray-400 hover:text-white border border-border hover:border-gray-600 transition-all"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Download {fixedFilename}
+                    </button>
                   </div>
                 </motion.div>
               )}
             </div>
           </div>
         </div>
+      )}
+
+      {/* ── Confirm Modal ─────────────────────────────────────────────────────── */}
+      {showConfirm && (
+        <ConfirmModal
+          issueCount={reviewInfo?.issues?.length ?? 0}
+          onConfirm={handleStart}
+          onCancel={() => setShowConfirm(false)}
+        />
       )}
     </div>
   );
