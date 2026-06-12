@@ -246,7 +246,6 @@ def build_review_graph() -> StateGraph:
     graph.add_node("analyze_structure", analyze_structure)
     graph.add_node("bug_check", bug_check)
     graph.add_node("security_check", security_check)
-    graph.add_node("style_check", style_check)
     graph.add_node("performance_check", performance_check)
     graph.add_node("aggregate", aggregate)
 
@@ -254,7 +253,7 @@ def build_review_graph() -> StateGraph:
 
     graph.add_edge("analyze_structure", "bug_check")
     graph.add_edge("analyze_structure", "security_check")
-    graph.add_edge("analyze_structure", "style_check")
+    graph.add_edge("style_check", "aggregate")
     graph.add_edge("analyze_structure", "performance_check")
 
     graph.add_edge("bug_check", "aggregate")
@@ -357,7 +356,7 @@ async def stream_review_progress(review_id: str, code: str, language: str):
 
     # Step 2: parallel checks
     queue: asyncio.Queue = asyncio.Queue()
-    parallel_nodes = ["bug_check", "security_check", "style_check", "performance_check"]
+    parallel_nodes = ["bug_check", "security_check", "performance_check"]
     total_issues = 0
     all_issues = []
 
