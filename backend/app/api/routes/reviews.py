@@ -256,6 +256,7 @@ async def create_review_from_pr(
     })
 
     logger.info("pr_review.created", review_id=str(review.id), pr=f"{owner}/{repo}#{pr_number}")
+    await db.refresh(review, ["issues"])
     return ReviewOut.model_validate(review)
 
 
