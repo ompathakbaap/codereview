@@ -32,6 +32,8 @@ def get_llm(streaming: bool = False) -> ChatGroq:
         model=settings.GROQ_MODEL,
         temperature=0.15,
         streaming=streaming,
+        max_retries=0,
+        request_timeout=30,
     )
 
 
