@@ -137,6 +137,8 @@ async def _invoke_fix_with_fallback(messages: list, max_tokens: int = 4096) -> s
 
 
 _MAX_CODE_LINES = 80
+_MAX_FIX_ISSUES = 8
+_FIX_MAX_TOKENS = 8192
 
 
 def _truncate_code(code: str, max_lines: int = _MAX_CODE_LINES) -> tuple[str, bool]:
@@ -150,6 +152,46 @@ def _truncate_code(code: str, max_lines: int = _MAX_CODE_LINES) -> tuple[str, bo
     truncated = "\n".join(lines[:max_lines])
     notice = f"\n# ... [file truncated at line {max_lines} of {len(lines)} for token budget] ..."
     return truncated + notice, True
+
+
+def _extract_json_object(raw: str) -> str:
+    """Extract the first balanced JSON object, tolerating text/fences around it."""
+    clean = raw.strip()
+    clean = re.sub(r"^```(?:json)?\s*", "", clean)
+    clean = re.sub(r"\s*```$", "", clean).strip()
+
+    start = clean.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found", clean, 0)
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(clean)):
+        char = clean[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return clean[start:index + 1]
+
+    raise json.JSONDecodeError("Unterminated JSON object", clean, start)
+
+
+def _parse_fix_result(raw: str) -> dict:
+    return json.loads(_extract_json_object(raw))
 
 
 def compute_unified_diff(original: str, fixed: str, language: str) -> str:
@@ -195,12 +237,12 @@ Return ONLY this JSON structure, no markdown, no explanation, nothing else:
   "plan": [
     {
       "issue_id": "<id from input>",
-      "fix_summary": "<one sentence: what was changed>",
+      "fix_summary": "<short phrase: what was changed>",
       "priority": "critical|high|medium|low"
     }
   ],
   "explanations": {
-    "<issue_id>": "<2-3 sentence explanation: what was wrong, what changed, why it matters>"
+    "<issue_id>": "<one short sentence>"
   }
 }
 
@@ -210,6 +252,7 @@ Rules:
 - Do not add new features, only fix what is listed
 - Do not wrap fixed_code in markdown code fences
 - Include an explanation for every issue id
+- Keep explanations concise to avoid truncated JSON
 - Return ONLY the JSON object, nothing before or after it"""
 
 
@@ -241,6 +284,7 @@ async def stream_fix_progress(review_id: str, code: str, language: str, issues: 
             sent_lines=_MAX_CODE_LINES,
         )
 
+    selected_issues = issues[:_MAX_FIX_ISSUES]
     issues_summary = json.dumps([
         {
             "id": i.get("id", ""),
@@ -249,9 +293,9 @@ async def stream_fix_progress(review_id: str, code: str, language: str, issues: 
             "title": i.get("title"),
             "description": i.get("description"),
             "suggestion": i.get("suggestion", ""),
-            "code_snippet": i.get("code_snippet", ""),
+            "code_snippet": (i.get("code_snippet", "") or "")[:160],
         }
-        for i in issues
+        for i in selected_issues
     ], indent=2)
 
     prompt = f"""Language: {language}
@@ -262,7 +306,7 @@ Code:
 Issues to fix:
 {issues_summary}
 
-Return the JSON object as described."""
+Return the JSON object as described. Fix only the listed issues."""
 
     try:
         # Brief pause so fix calls don't immediately stack on top of review TPM usage
@@ -270,14 +314,19 @@ Return the JSON object as described."""
         raw = await _invoke_fix_with_fallback([
             SystemMessage(content=FIX_SYSTEM),
             HumanMessage(content=prompt),
-        ], max_tokens=4096)
+        ], max_tokens=_FIX_MAX_TOKENS)
 
-        raw = raw.strip()
-        # Strip accidental markdown fences
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-
-        result = json.loads(raw)
+        try:
+            result = _parse_fix_result(raw)
+        except json.JSONDecodeError as parse_error:
+            if getattr(settings, "OLLAMA_BASE_URL", None) or not getattr(settings, "GEMINI_API_KEY", None):
+                raise parse_error
+            logger.warning("fix_agent.parse_failed_retrying_gemini", review_id=review_id, error=str(parse_error))
+            raw = await _invoke_gemini_fix([
+                SystemMessage(content=FIX_SYSTEM),
+                HumanMessage(content=prompt),
+            ], max_tokens=_FIX_MAX_TOKENS)
+            result = _parse_fix_result(raw)
 
     except json.JSONDecodeError as e:
         logger.error("fix_agent.parse_failed", review_id=review_id, error=str(e))
