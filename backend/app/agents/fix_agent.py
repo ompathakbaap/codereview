@@ -18,6 +18,7 @@ import asyncio
 import json
 import re
 import difflib
+import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.config import settings
 import structlog
@@ -73,6 +74,65 @@ async def _invoke_with_retry(llm, messages: list, max_retries: int = 3):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _is_rate_limit_or_service_error(error: Exception) -> bool:
+    err = str(error).lower()
+    return any(token in err for token in ["429", "rate_limit", "rate limit", "503", "overloaded", "timeout", "service busy"])
+
+
+async def _invoke_gemini_fix(messages: list, max_tokens: int = 4096) -> str:
+    """Use Gemini REST as the hosted fallback for Fix-It."""
+    model = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    prompt = "\n\n".join(message.content for message in messages)
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.15,
+            "maxOutputTokens": max_tokens,
+            "responseMimeType": "application/json",
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": settings.GEMINI_API_KEY,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    parts = (
+        data.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [])
+    )
+    text = "".join(part.get("text", "") for part in parts)
+    if not text:
+        raise Exception("Gemini fallback returned an empty Fix-It response.")
+    logger.info("fix_agent.gemini_fallback_done", model=model)
+    return text
+
+
+async def _invoke_fix_with_fallback(messages: list, max_tokens: int = 4096) -> str:
+    """
+    Use Ollama locally when configured. In hosted mode, try Groq once and
+    fail over to Gemini on rate-limit/service errors.
+    """
+    if getattr(settings, "OLLAMA_BASE_URL", None):
+        response = await _invoke_with_retry(get_llm(max_tokens=max_tokens), messages)
+        return response.content
+
+    try:
+        response = await _invoke_with_retry(get_llm(max_tokens=max_tokens), messages, max_retries=1)
+        return response.content
+    except Exception as e:
+        if not getattr(settings, "GEMINI_API_KEY", None) or not _is_rate_limit_or_service_error(e):
+            raise
+        logger.warning("fix_agent.primary_failed_using_gemini", error=str(e))
+        return await _invoke_gemini_fix(messages, max_tokens=max_tokens)
+
 
 _MAX_CODE_LINES = 80
 
@@ -203,15 +263,14 @@ Issues to fix:
 Return the JSON object as described."""
 
     try:
-        llm = get_llm(max_tokens=4096)
         # Brief pause so fix calls don't immediately stack on top of review TPM usage
         await asyncio.sleep(2)
-        response = await _invoke_with_retry(llm, [
+        raw = await _invoke_fix_with_fallback([
             SystemMessage(content=FIX_SYSTEM),
             HumanMessage(content=prompt),
-        ])
+        ], max_tokens=4096)
 
-        raw = response.content.strip()
+        raw = raw.strip()
         # Strip accidental markdown fences
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw).strip()
