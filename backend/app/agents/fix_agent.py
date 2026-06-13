@@ -139,6 +139,7 @@ async def _invoke_fix_with_fallback(messages: list, max_tokens: int = 4096) -> s
 _MAX_CODE_LINES = 300
 _MAX_FIX_ISSUES = 12
 _FIX_MAX_TOKENS = 8192
+_POLISH_MAX_ISSUES = 6
 
 
 def _truncate_code(code: str, max_lines: int = _MAX_CODE_LINES) -> tuple[str, bool]:
@@ -192,6 +193,12 @@ def _extract_json_object(raw: str) -> str:
 
 def _parse_fix_result(raw: str) -> dict:
     return json.loads(_extract_json_object(raw))
+
+
+def _parse_issue_list(raw: str) -> list[dict]:
+    data = json.loads(_extract_json_object(raw))
+    issues = data.get("issues", [])
+    return issues if isinstance(issues, list) else []
 
 
 def _is_partial_fixed_code(original: str, fixed: str) -> bool:
@@ -264,6 +271,82 @@ Rules:
 - Include an explanation for every issue id
 - Keep explanations concise to avoid truncated JSON
 - Return ONLY the JSON object, nothing before or after it"""
+
+
+POLISH_REVIEW_SYSTEM = """You are auditing code that was already auto-fixed.
+
+Return ONLY a valid JSON object:
+{
+  "issues": [
+    {
+      "category": "bug|security|performance",
+      "severity": "critical|high|medium|low",
+      "title": "short title",
+      "description": "one concise sentence",
+      "suggestion": "one concise sentence",
+      "code_snippet": "short snippet, max 120 chars"
+    }
+  ]
+}
+
+Report at most 6 serious remaining bugs/security/performance issues. Ignore style-only issues. If the code is acceptable, return {"issues":[]}.
+"""
+
+
+async def _audit_fixed_code(code: str, language: str) -> list[dict]:
+    code_for_llm, _ = _truncate_code(code)
+    messages = [
+        SystemMessage(content=POLISH_REVIEW_SYSTEM),
+        HumanMessage(content=f"Language: {language}\n\n```\n{code_for_llm}\n```"),
+    ]
+    try:
+        raw = await _invoke_fix_with_fallback(messages, max_tokens=2048)
+        issues = _parse_issue_list(raw)
+        return issues[:_POLISH_MAX_ISSUES]
+    except Exception as e:
+        logger.warning("fix_agent.polish_audit_failed", error=str(e))
+        return []
+
+
+async def _refine_fixed_code(
+    fixed_code: str,
+    language: str,
+    remaining_issues: list[dict],
+) -> tuple[str, list[dict], dict]:
+    issues_summary = json.dumps([
+        {
+            "id": f"polish-{index + 1}",
+            "category": issue.get("category"),
+            "severity": issue.get("severity"),
+            "title": issue.get("title"),
+            "description": issue.get("description"),
+            "suggestion": issue.get("suggestion", ""),
+            "code_snippet": (issue.get("code_snippet", "") or "")[:160],
+        }
+        for index, issue in enumerate(remaining_issues[:_POLISH_MAX_ISSUES])
+    ], indent=2)
+
+    prompt = f"""Language: {language}
+
+Current fixed code:
+{fixed_code}
+
+Remaining issues to fix silently:
+{issues_summary}
+
+Return the JSON object as described. Preserve the complete current fixed file and only repair the listed remaining issues."""
+
+    raw = await _invoke_fix_with_fallback([
+        SystemMessage(content=FIX_SYSTEM),
+        HumanMessage(content=prompt),
+    ], max_tokens=_FIX_MAX_TOKENS)
+    result = _parse_fix_result(raw)
+    refined_code = result.get("fixed_code", "").strip()
+    refined_code = re.sub(r"^```[\w]*\n?", "", refined_code)
+    refined_code = re.sub(r"\n?```$", "", refined_code).strip()
+    plan = result.get("plan", [])
+    explanations = result.get("explanations", {})
+    return refined_code, plan, explanations
 
 
 # ── Streaming Generator ────────────────────────────────────────────────────────
@@ -390,6 +473,30 @@ Return the JSON object as described. Fix only the listed issues."""
 
     plan = result.get("plan", [])
     explanations = result.get("explanations", {})
+
+    if not was_truncated:
+        remaining_issues = await _audit_fixed_code(fixed_code, language)
+        if remaining_issues:
+            logger.info(
+                "fix_agent.polish_refine_start",
+                review_id=review_id,
+                remaining_count=len(remaining_issues),
+            )
+            try:
+                refined_code, polish_plan, polish_explanations = await _refine_fixed_code(
+                    fixed_code,
+                    language,
+                    remaining_issues,
+                )
+                if refined_code and not _is_partial_fixed_code(code, refined_code):
+                    fixed_code = refined_code
+                    plan = plan + polish_plan
+                    explanations = {**explanations, **polish_explanations}
+                    logger.info("fix_agent.polish_refine_done", review_id=review_id)
+                else:
+                    logger.warning("fix_agent.polish_refine_partial_or_empty", review_id=review_id)
+            except Exception as e:
+                logger.warning("fix_agent.polish_refine_failed", review_id=review_id, error=str(e))
 
     # Emit plan
     yield {"type": "plan_done", "plan": plan}
