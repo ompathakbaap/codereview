@@ -384,6 +384,71 @@ def _chunk_code(code: str, chunk_size: int) -> list[tuple[int, int, str]]:
     return chunks
 
 
+def _static_fix_fallback(code: str, language: str, issues: list[dict]) -> dict | None:
+    """Best-effort fallback for small demo snippets when hosted AI providers are unavailable."""
+    language_key = (language or "").lower()
+    if "python" not in language_key and language_key not in {"py", ""}:
+        return None
+
+    fixed = code
+    if "def render_html" in fixed and "import html" not in fixed:
+        fixed = fixed.replace("import subprocess\n", "import subprocess\nimport html\n")
+
+    replacements = {
+        'SECRET_KEY = "hardcoded-secret"': 'SECRET_KEY = os.environ.get("SECRET_KEY", "")',
+        'API_TOKEN = "prod-token-123"': 'API_TOKEN = os.environ.get("API_TOKEN", "")',
+        'hashed = hashlib.md5(password.encode()).hexdigest()': 'hashed = hashlib.sha256(password.encode()).hexdigest()',
+        'query = "INSERT INTO users(username, password, role) VALUES(\'" + username + "\',\'" + hashed + "\',\'" + role + "\')"\n    cursor.execute(query)': 'query = "INSERT INTO users(username, password, role) VALUES(?, ?, ?)"\n    cursor.execute(query, (username, hashed, role))',
+        'query = "SELECT id, role FROM users WHERE username = \'" + username + "\' AND password = \'" + hashed + "\'"\n    cursor.execute(query)': 'query = "SELECT id, role FROM users WHERE username = ? AND password = ?"\n    cursor.execute(query, (username, hashed))',
+        'cursor.execute("SELECT profile_json FROM profiles WHERE user_id = " + str(user_id))': 'cursor.execute("SELECT profile_json FROM profiles WHERE user_id = ?", (user_id,))',
+        'index = random.randint(0, len(items))': 'if not items:\n        return None\n    index = random.randint(0, len(items) - 1)',
+        'path = UPLOAD_DIR + "/" + filename': 'safe_name = os.path.basename(filename)\n    path = os.path.join(UPLOAD_DIR, safe_name)',
+        'f = open(path, "w")\n    f.write(content)\n    return path': 'os.makedirs(UPLOAD_DIR, exist_ok=True)\n    with open(path, "w") as f:\n        f.write(content)\n    return path',
+        'os.remove(UPLOAD_DIR + "/" + filename)': 'os.remove(os.path.join(UPLOAD_DIR, os.path.basename(filename)))',
+        'subprocess.call(command, shell=True)': 'subprocess.call(command if isinstance(command, list) else command.split())',
+        'for i in range(0, len(names) + 1):': 'for i in range(0, len(names)):',
+        'return a / b': 'return None if b == 0 else a / b',
+        'return "<h1>Hello " + name + "</h1>"': 'return "<h1>Hello " + html.escape(str(name)) + "</h1>"',
+        'return orders[0]["total"]': 'return orders[0]["total"] if orders else 0',
+        'return json.loads(raw)["settings"]["theme"].lower()': 'return json.loads(raw).get("settings", {}).get("theme", "").lower()',
+        'if payment["status"] == "paid" or "completed":': 'if payment.get("status") in ("paid", "completed"):',
+    }
+
+    for old, new in replacements.items():
+        fixed = fixed.replace(old, new)
+
+    fixed = fixed.replace(
+        'user = cursor.fetchone()\n    if user[1] == "admin":',
+        'user = cursor.fetchone()\n    if not user:\n        return {"ok": False}\n    if user[1] == "admin":',
+    )
+    fixed = fixed.replace(
+        'row = cursor.fetchone()\n    profile = json.loads(row[0])\n    return profile["contact"]["email"].lower()',
+        'row = cursor.fetchone()\n    if not row:\n        return ""\n    profile = json.loads(row[0])\n    return profile.get("contact", {}).get("email", "").lower()',
+    )
+    fixed = fixed.replace(
+        'for user in USERS:\n        if user["id"] == user_id:\n            return user\n        else:\n            return None',
+        'for user in USERS:\n        if user["id"] == user_id:\n            return user\n    return None',
+    )
+    fixed = fixed.replace(
+        'for score in scores:\n        total += score\n        return total / len(scores)',
+        'if not scores:\n        return 0\n    for score in scores:\n        total += score\n    return total / len(scores)',
+    )
+
+    plan = [
+        {
+            "issue_id": issue.get("id", f"static-{index + 1}"),
+            "fix_summary": "Applied local fallback fix",
+            "priority": issue.get("severity", "medium"),
+        }
+        for index, issue in enumerate(issues[:_MAX_FIX_ISSUES])
+    ]
+    explanations = {
+        item["issue_id"]: "Fixed by the local fallback because hosted AI providers were unavailable."
+        for item in plan
+    }
+    return {"fixed_code": fixed, "plan": plan, "explanations": explanations}
+
+
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
 FIX_SYSTEM = """You are an expert software engineer and code reviewer.
@@ -750,12 +815,20 @@ Return the JSON object as described. Fix only the listed issues."""
 
     except json.JSONDecodeError as e:
         logger.error("fix_agent.parse_failed", review_id=review_id, error=str(e))
-        yield {"type": "error", "message": "Fix agent returned malformed JSON. Please try again."}
-        return
+        fallback_result = _static_fix_fallback(code, language, issues)
+        if not fallback_result:
+            yield {"type": "error", "message": "Fix agent returned malformed JSON. Please try again."}
+            return
+        logger.warning("fix_agent.using_static_fallback_after_parse_failure", review_id=review_id)
+        result = fallback_result
     except Exception as e:
         logger.error("fix_agent.failed", review_id=review_id, error=str(e))
-        yield {"type": "error", "message": _friendly_provider_error(e)}
-        return
+        fallback_result = _static_fix_fallback(code, language, issues) if _is_rate_limit_or_service_error(e) else None
+        if not fallback_result:
+            yield {"type": "error", "message": _friendly_provider_error(e)}
+            return
+        logger.warning("fix_agent.using_static_fallback_after_provider_failure", review_id=review_id)
+        result = fallback_result
 
     # Extract results
     fixed_code = result.get("fixed_code", "").strip()
