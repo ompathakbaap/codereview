@@ -12,6 +12,7 @@ Each node runs in parallel; results are merged in aggregate.
 import json
 import re
 import asyncio
+import httpx
 from typing import TypedDict, Annotated, List
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -40,7 +41,7 @@ class ReviewState(TypedDict):
 
 # -- LLM factory --------------------------------------------------------------
 
-def get_llm(streaming: bool = False) -> BaseChatModel:
+def get_llm(streaming: bool = False, max_tokens: int | None = None) -> BaseChatModel:
     """
     Returns ChatOllama if OLLAMA_BASE_URL is configured, else ChatGroq.
     To use Ollama: set OLLAMA_BASE_URL=http://localhost:11434 and OLLAMA_MODEL=llama3.2
@@ -57,11 +58,13 @@ def get_llm(streaming: bool = False) -> BaseChatModel:
     else:
         from langchain_groq import ChatGroq
         logger.info("llm.backend", backend="groq", model=settings.GROQ_MODEL)
+        groq_kwargs = {"max_tokens": max_tokens} if max_tokens is not None else {}
         return ChatGroq(
             api_key=settings.GROQ_API_KEY,
             model=settings.GROQ_MODEL,
             temperature=0.1,
             streaming=streaming,
+            **groq_kwargs,
         )
 
 
@@ -83,6 +86,11 @@ async def _invoke_with_retry(llm: BaseChatModel, messages: list, max_retries: in
     raise Exception("Service busy — rate limit exceeded after retries. Please try again in a few minutes.")
 
 
+def _is_rate_limit_or_service_error(error: Exception) -> bool:
+    err = str(error).lower()
+    return any(token in err for token in ["429", "rate_limit", "rate limit", "503", "overloaded", "timeout"])
+
+
 # -- Issue parser -------------------------------------------------------------
 
 def _parse_issues(raw: str, category: str) -> list[dict]:
@@ -98,6 +106,127 @@ def _parse_issues(raw: str, category: str) -> list[dict]:
     except Exception as e:
         logger.warning("parse_issues_failed", category=category, error=str(e))
         return []
+
+
+_MAX_REVIEW_CHARS = 10_000
+
+
+def _truncate_code_for_review(code: str) -> tuple[str, bool]:
+    """Trim large submissions so the active LLM backend stays within token limits."""
+    if len(code) <= _MAX_REVIEW_CHARS:
+        return code, False
+    return (
+        code[:_MAX_REVIEW_CHARS]
+        + f"\n\n... [code truncated at {_MAX_REVIEW_CHARS} characters for token budget] ...",
+        True,
+    )
+
+
+REVIEW_SYSTEM = """You are a senior software engineer performing a concise code review.
+
+Review the code for bugs, security problems, style/maintainability issues, and performance issues in ONE pass.
+
+Return ONLY a valid JSON object, no markdown:
+{
+  "summary": "2-3 sentence summary of what the code does",
+  "issues": [
+    {
+      "category": "bug|security|style|performance",
+      "severity": "critical|high|medium|low|info",
+      "line_start": <line number as integer or null>,
+      "line_end": <line number as integer or null>,
+      "title": "short title",
+      "description": "what is wrong and why it matters",
+      "suggestion": "specific remediation",
+      "code_snippet": "the exact relevant code"
+    }
+  ]
+}
+
+Prioritize real issues that would matter in a review demo. Do not invent issues. If no issues are found, return an empty issues array.
+"""
+
+
+def _parse_review_result(raw: str) -> tuple[str, list[dict]]:
+    """Parse the single-call review JSON."""
+    try:
+        clean = raw.strip()
+        clean = re.sub(r"^```(?:json)?\s*", "", clean)
+        clean = re.sub(r"\s*```$", "", clean).strip()
+        data = json.loads(clean)
+        summary = data.get("summary", "")
+        issues = data.get("issues", [])
+        if not isinstance(issues, list):
+            issues = []
+        for issue in issues:
+            issue["category"] = issue.get("category", "bug")
+        return summary, issues
+    except Exception as e:
+        logger.warning("parse_review_result_failed", error=str(e))
+        return "", []
+
+
+async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
+    code_for_llm, was_truncated = _truncate_code_for_review(code)
+    if was_truncated:
+        logger.warning(
+            "review_agent.code_truncated",
+            original_chars=len(code),
+            sent_chars=len(code_for_llm),
+        )
+
+    messages = [
+        SystemMessage(content=REVIEW_SYSTEM),
+        HumanMessage(content=f"Language: {language}\n\n```\n{code_for_llm}\n```"),
+    ]
+
+    try:
+        llm = get_llm(max_tokens=2048)
+        response = await _invoke_with_retry(llm, messages)
+        return _parse_review_result(response.content)
+    except Exception as e:
+        if getattr(settings, "OLLAMA_BASE_URL", None):
+            raise
+        if not getattr(settings, "GEMINI_API_KEY", None) or not _is_rate_limit_or_service_error(e):
+            raise
+        logger.warning("review_agent.primary_failed_using_gemini", error=str(e))
+        raw = await _invoke_gemini_review(messages, max_tokens=2048)
+        return _parse_review_result(raw)
+
+
+async def _invoke_gemini_review(messages: list, max_tokens: int = 2048) -> str:
+    """Use Gemini REST as a hosted fallback without adding another SDK."""
+    model = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    prompt = "\n\n".join(message.content for message in messages)
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": max_tokens,
+            "responseMimeType": "application/json",
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": settings.GEMINI_API_KEY,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    parts = (
+        data.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [])
+    )
+    text = "".join(part.get("text", "") for part in parts)
+    if not text:
+        raise Exception("Gemini fallback returned an empty response.")
+    logger.info("review_agent.gemini_fallback_done", model=model)
+    return text
 
 
 # -- Node: Analyze Structure --------------------------------------------------
@@ -279,18 +408,17 @@ review_graph = build_review_graph()
 
 
 async def run_review(review_id: str, code: str, language: str) -> ReviewState:
-    """Run the full LangGraph review pipeline."""
-    initial_state: ReviewState = {
+    """Run the review pipeline with one LLM call on the active backend."""
+    summary, issues = await review_all_once(code, language)
+    return {
         "code": code,
         "language": language,
         "review_id": review_id,
-        "structure_summary": "",
-        "issues": [],
-        "status": "running",
+        "structure_summary": summary,
+        "issues": issues,
+        "status": "complete",
         "error": "",
     }
-    result = await review_graph.ainvoke(initial_state)
-    return result
 
 
 # -- SSE Streaming ------------------------------------------------------------
@@ -351,29 +479,27 @@ async def _stream_node(node: str, code: str, language: str):
 async def stream_review_progress(review_id: str, code: str, language: str):
     """
     Async generator for SSE endpoint.
-    Streams all nodes concurrently, emitting tokens in arrival order.
+    Emits the same node-shaped progress events while using one LLM request.
     """
-    # Step 1: structure analysis
-    llm = get_llm()
     yield {"type": "node_start", "node": "analyze_structure", "label": _NODE_LABELS["analyze_structure"]}
-    struct_resp = await _invoke_with_retry(llm, [
-        SystemMessage(content="You are a senior software engineer. Briefly summarize what this code does in 2-3 sentences. Be concise."),
-        HumanMessage(content=f"Language: {language}\n\n```\n{code}\n```"),
-    ])
-    yield {"type": "node_done", "node": "analyze_structure", "issue_count": 0, "summary": struct_resp.content}
+    summary, all_issues = await review_all_once(code, language)
+    yield {"type": "node_done", "node": "analyze_structure", "issue_count": 0, "summary": summary}
 
-    # Step 2: sequential checks (parallel caused TPM rate limit failures on Groq free tier)
-    sequential_nodes = ["bug_check", "security_check", "performance_check"]
-    total_issues = 0
-    all_issues = []
+    node_categories = {
+        "bug_check": "bug",
+        "security_check": "security",
+        "style_check": "style",
+        "performance_check": "performance",
+    }
 
-    for node in sequential_nodes:
-        async for event in _stream_node(node, code, language):
-            if event.get("type") == "node_done":
-                total_issues += event.get("issue_count", 0)
-                all_issues.extend(event.get("issues", []))
-            yield event
-        # Small pause between nodes to stay within Groq free-tier TPM window
-        await asyncio.sleep(2)
+    for node, category in node_categories.items():
+        yield {"type": "node_start", "node": node, "label": _NODE_LABELS[node]}
+        node_issues = [issue for issue in all_issues if issue.get("category") == category]
+        yield {
+            "type": "node_done",
+            "node": node,
+            "issue_count": len(node_issues),
+            "issues": node_issues,
+        }
 
-    yield {"type": "complete", "issue_count": total_issues, "issues": all_issues}
+    yield {"type": "complete", "issue_count": len(all_issues), "issues": all_issues}

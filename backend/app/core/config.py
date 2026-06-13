@@ -19,6 +19,15 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
+    # Gemini — hosted API fallback when Groq is rate-limited/unavailable
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash-lite"
+
+    # Optional local/offline LLM backend for development.
+    # When set, the review/fix agents use Ollama instead of Groq.
+    OLLAMA_BASE_URL: str = ""
+    OLLAMA_MODEL: str = "llama3.2"
+
     FRONTEND_URL: str = "http://localhost:3000"
 
     # GitHub — optional, needed for private repos + avoids rate limits
