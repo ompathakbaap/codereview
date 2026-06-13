@@ -113,6 +113,7 @@ def _parse_issues(raw: str, category: str) -> list[dict]:
 
 
 _MAX_REVIEW_CHARS = 10_000
+_REVIEW_MAX_TOKENS = 3072
 
 
 def _truncate_code_for_review(code: str) -> tuple[str, bool]:
@@ -124,6 +125,42 @@ def _truncate_code_for_review(code: str) -> tuple[str, bool]:
         + f"\n\n... [code truncated at {_MAX_REVIEW_CHARS} characters for token budget] ...",
         True,
     )
+
+
+def _extract_json_object(raw: str) -> str:
+    """Extract the first balanced JSON object, tolerating fences or extra text."""
+    clean = raw.strip()
+    clean = re.sub(r"^```(?:json)?\s*", "", clean)
+    clean = re.sub(r"\s*```$", "", clean).strip()
+
+    start = clean.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found", clean, 0)
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(clean)):
+        char = clean[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return clean[start:index + 1]
+
+    raise json.JSONDecodeError("Unterminated JSON object", clean, start)
 
 
 REVIEW_SYSTEM = """You are a senior software engineer performing a concise code review.
@@ -147,16 +184,14 @@ Return ONLY a valid JSON object, no markdown:
   ]
 }
 
-Return at most 12 issues. Prioritize real bugs/security issues that would matter in a review demo. Do not invent issues. If no issues are found, return an empty issues array.
+Return at most 8 issues. Prioritize real bugs/security issues that would matter in a review demo. Keep all fields short. Do not invent issues. If no issues are found, return an empty issues array.
 """
 
 
 def _parse_review_result(raw: str) -> tuple[str, list[dict]]:
     """Parse the single-call review JSON."""
     try:
-        clean = raw.strip()
-        clean = re.sub(r"^```(?:json)?\s*", "", clean)
-        clean = re.sub(r"\s*```$", "", clean).strip()
+        clean = _extract_json_object(raw)
         data = json.loads(clean)
         summary = data.get("summary", "")
         issues = data.get("issues", [])
@@ -185,7 +220,7 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
     ]
 
     try:
-        llm = get_llm(max_tokens=2048)
+        llm = get_llm(max_tokens=_REVIEW_MAX_TOKENS)
         groq_retries = 3 if getattr(settings, "OLLAMA_BASE_URL", None) else 1
         response = await _invoke_with_retry(llm, messages, max_retries=groq_retries)
         return _parse_review_result(response.content)
@@ -195,8 +230,17 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
         if not getattr(settings, "GEMINI_API_KEY", None) or not _is_rate_limit_or_service_error(e):
             raise
         logger.warning("review_agent.primary_failed_using_gemini", error=str(e))
-        raw = await _invoke_gemini_review(messages, max_tokens=2048)
-        return _parse_review_result(raw)
+        raw = await _invoke_gemini_review(messages, max_tokens=_REVIEW_MAX_TOKENS)
+        try:
+            return _parse_review_result(raw)
+        except ValueError as parse_error:
+            logger.warning("review_agent.gemini_parse_failed_retrying_compact", error=str(parse_error))
+            compact_messages = [
+                SystemMessage(content=REVIEW_SYSTEM + "\nUse extremely compact JSON. No field may exceed 80 characters."),
+                HumanMessage(content=f"Language: {language}\n\n```\n{code_for_llm}\n```"),
+            ]
+            raw = await _invoke_gemini_review(compact_messages, max_tokens=2048)
+            return _parse_review_result(raw)
 
 
 async def _invoke_gemini_review(messages: list, max_tokens: int = 2048) -> str:
