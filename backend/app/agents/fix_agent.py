@@ -133,7 +133,12 @@ async def _invoke_fix_with_fallback(messages: list, max_tokens: int = 4096) -> s
         if not getattr(settings, "GEMINI_API_KEY", None) or not _is_rate_limit_or_service_error(e):
             raise
         logger.warning("fix_agent.primary_failed_using_gemini", error=str(e))
-        return await _invoke_gemini_fix(messages, max_tokens=max_tokens)
+        try:
+            return await _invoke_gemini_fix(messages, max_tokens=max_tokens)
+        except httpx.HTTPStatusError as gemini_error:
+            if gemini_error.response.status_code == 429:
+                logger.warning("fix_agent.gemini_rate_limited")
+            raise
 
 
 _MAX_CODE_LINES = 300
@@ -407,6 +412,13 @@ async def _audit_fixed_code(code: str, language: str) -> list[dict]:
     try:
         raw = await _invoke_fix_with_fallback(messages, max_tokens=2048)
         issues = _parse_issue_list(raw)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            logger.warning("fix_agent.polish_audit_rate_limited")
+            issues = []
+        else:
+            logger.warning("fix_agent.polish_audit_failed", error=str(e))
+            issues = []
     except Exception as e:
         logger.warning("fix_agent.polish_audit_failed", error=str(e))
         issues = []
@@ -539,10 +551,16 @@ Return the JSON object as described. Fix only the listed issues."""
             if getattr(settings, "OLLAMA_BASE_URL", None) or not getattr(settings, "GEMINI_API_KEY", None):
                 raise parse_error
             logger.warning("fix_agent.parse_failed_retrying_gemini", review_id=review_id, error=str(parse_error))
-            raw = await _invoke_gemini_fix([
-                SystemMessage(content=FIX_SYSTEM),
-                HumanMessage(content=prompt),
-            ], max_tokens=_FIX_MAX_TOKENS)
+            try:
+                raw = await _invoke_gemini_fix([
+                    SystemMessage(content=FIX_SYSTEM),
+                    HumanMessage(content=prompt),
+                ], max_tokens=_FIX_MAX_TOKENS)
+            except httpx.HTTPStatusError as gemini_error:
+                if gemini_error.response.status_code == 429:
+                    logger.warning("fix_agent.parse_retry_gemini_rate_limited", review_id=review_id)
+                    raise parse_error
+                raise
             result = _parse_fix_result(raw)
 
     except json.JSONDecodeError as e:
@@ -578,10 +596,17 @@ Return the JSON object as described. Fix only the listed issues."""
         )
         retry_prompt = prompt + "\n\nThe previous answer was partial. Return the COMPLETE corrected file, preserving every function from the input."
         try:
-            raw = await _invoke_gemini_fix([
-                SystemMessage(content=FIX_SYSTEM),
-                HumanMessage(content=retry_prompt),
-            ], max_tokens=_FIX_MAX_TOKENS)
+            try:
+                raw = await _invoke_gemini_fix([
+                    SystemMessage(content=FIX_SYSTEM),
+                    HumanMessage(content=retry_prompt),
+                ], max_tokens=_FIX_MAX_TOKENS)
+            except httpx.HTTPStatusError as gemini_error:
+                if gemini_error.response.status_code == 429:
+                    logger.warning("fix_agent.partial_retry_gemini_rate_limited", review_id=review_id)
+                    yield {"type": "error", "message": "Fix agent returned partial code. Please try again in a few minutes."}
+                    return
+                raise
             result = _parse_fix_result(raw)
             fixed_code = result.get("fixed_code", "").strip()
             fixed_code = re.sub(r"^```[\w]*\n?", "", fixed_code)
@@ -623,6 +648,12 @@ Return the JSON object as described. Fix only the listed issues."""
                 else:
                     logger.warning("fix_agent.polish_refine_partial_or_empty", review_id=review_id)
                     break
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    logger.warning("fix_agent.polish_refine_rate_limited", review_id=review_id)
+                else:
+                    logger.warning("fix_agent.polish_refine_failed", review_id=review_id, error=str(e))
+                break
             except Exception as e:
                 logger.warning("fix_agent.polish_refine_failed", review_id=review_id, error=str(e))
                 break

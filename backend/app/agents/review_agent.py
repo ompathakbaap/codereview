@@ -304,7 +304,13 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
         if not getattr(settings, "GEMINI_API_KEY", None) or not _is_rate_limit_or_service_error(e):
             raise
         logger.warning("review_agent.primary_failed_using_gemini", error=str(e))
-        raw = await _invoke_gemini_review(messages, max_tokens=_REVIEW_MAX_TOKENS)
+        try:
+            raw = await _invoke_gemini_review(messages, max_tokens=_REVIEW_MAX_TOKENS)
+        except httpx.HTTPStatusError as gemini_error:
+            if gemini_error.response.status_code == 429:
+                logger.warning("review_agent.gemini_rate_limited_using_static_fallback")
+                return _deterministic_review(code_for_llm, language)
+            raise
         try:
             return _parse_review_result(raw)
         except ValueError as parse_error:
@@ -313,7 +319,13 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
                 SystemMessage(content=REVIEW_SYSTEM + "\nUse extremely compact JSON. No field may exceed 80 characters."),
                 HumanMessage(content=f"Language: {language}\n\n```\n{code_for_llm}\n```"),
             ]
-            raw = await _invoke_gemini_review(compact_messages, max_tokens=2048)
+            try:
+                raw = await _invoke_gemini_review(compact_messages, max_tokens=2048)
+            except httpx.HTTPStatusError as gemini_error:
+                if gemini_error.response.status_code == 429:
+                    logger.warning("review_agent.gemini_compact_rate_limited_using_static_fallback")
+                    return _deterministic_review(code_for_llm, language)
+                raise
             try:
                 return _parse_review_result(raw)
             except ValueError as final_parse_error:
