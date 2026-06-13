@@ -82,6 +82,13 @@ def _is_rate_limit_or_service_error(error: Exception) -> bool:
     return any(token in err for token in ["429", "rate_limit", "rate limit", "503", "overloaded", "timeout", "service busy"])
 
 
+def _friendly_provider_error(error: Exception) -> str:
+    err = str(error).lower()
+    if "429" in err or "too many requests" in err or "rate_limit" in err or "rate limit" in err:
+        return "AI providers are temporarily rate-limited. Please wait a minute and try again."
+    return str(error)
+
+
 async def _invoke_gemini_fix(messages: list, max_tokens: int = 4096) -> str:
     """Use Gemini REST as the hosted fallback for Fix-It."""
     model = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash-lite")
@@ -138,6 +145,7 @@ async def _invoke_fix_with_fallback(messages: list, max_tokens: int = 4096) -> s
         except httpx.HTTPStatusError as gemini_error:
             if gemini_error.response.status_code == 429:
                 logger.warning("fix_agent.gemini_rate_limited")
+                raise RuntimeError("AI providers are temporarily rate-limited. Please wait a minute and try again.") from gemini_error
             raise
 
 
@@ -569,7 +577,7 @@ Return the JSON object as described. Fix only the listed issues."""
         return
     except Exception as e:
         logger.error("fix_agent.failed", review_id=review_id, error=str(e))
-        yield {"type": "error", "message": str(e)}
+        yield {"type": "error", "message": _friendly_provider_error(e)}
         return
 
     # Extract results

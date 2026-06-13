@@ -26,6 +26,13 @@ limiter = Limiter(key_func=get_remote_address)
 router = APIRouter(prefix="/api/reviews", tags=["reviews"])
 
 
+def _safe_error_message(error: Exception) -> str:
+    err = str(error).lower()
+    if "429" in err or "too many requests" in err or "rate_limit" in err or "rate limit" in err:
+        return "AI providers are temporarily rate-limited. Please wait a minute and try again."
+    return str(error)
+
+
 # ── Shared: run agent + persist issues + broadcast ─────────────────────────────
 
 async def _run_agent_and_persist(review_id: str, code: str, language: str, db_url: str):
@@ -105,7 +112,7 @@ async def _run_agent_and_persist(review_id: str, code: str, language: str, db_ur
             await publish(f"review:{review_id}", {
                 "type": "review_error",
                 "review_id": review_id,
-                "error": str(e),
+                "error": _safe_error_message(e),
             })
 
 
@@ -404,7 +411,7 @@ async def stream_review(
                     break
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': _safe_error_message(e)})}\n\n"
 
     return StreamingResponse(
         event_generator(),

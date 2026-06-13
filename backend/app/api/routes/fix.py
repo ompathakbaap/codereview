@@ -26,6 +26,13 @@ logger = structlog.get_logger()
 router = APIRouter(prefix="/api/fix", tags=["fix"])
 
 
+def _safe_error_message(error: Exception) -> str:
+    err = str(error).lower()
+    if "429" in err or "too many requests" in err or "rate_limit" in err or "rate limit" in err:
+        return "AI providers are temporarily rate-limited. Please wait a minute and try again."
+    return str(error)
+
+
 @router.get("/{review_id}/stream")
 async def stream_fix(
     review_id: uuid.UUID,
@@ -88,7 +95,7 @@ async def stream_fix(
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
             logger.error("fix_stream_error", review_id=str(review_id), error=str(e))
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': _safe_error_message(e)})}\n\n"
 
     return StreamingResponse(
         event_generator(),
