@@ -113,7 +113,8 @@ def _parse_issues(raw: str, category: str) -> list[dict]:
 
 
 _MAX_REVIEW_CHARS = 10_000
-_REVIEW_MAX_TOKENS = 4096
+_REVIEW_MAX_TOKENS = 6144
+_REVIEW_MAX_ISSUES = 20
 
 
 def _truncate_code_for_review(code: str) -> tuple[str, bool]:
@@ -184,7 +185,7 @@ Return ONLY a valid JSON object, no markdown:
   ]
 }
 
-Return at most 14 issues. Prioritize real bugs/security issues that would matter in a review demo. Keep all fields short. Do not invent issues. If no issues are found, return an empty issues array.
+Return at most 20 issues. Prioritize real bugs/security issues that would matter in a review demo. Keep all fields short. Do not invent issues. If no issues are found, return an empty issues array.
 """
 
 
@@ -240,6 +241,10 @@ def _deterministic_review(code: str, language: str) -> tuple[str, list[dict]]:
         ("innerHTML", "security", "high", "Potential XSS", "Writing to innerHTML can execute untrusted markup.", "Use textContent or sanitize trusted HTML."),
         ("dangerouslySetInnerHTML", "security", "high", "Potential XSS", "dangerouslySetInnerHTML can render untrusted HTML.", "Sanitize HTML or avoid raw HTML rendering."),
         ("SELECT *", "performance", "low", "Broad database selection", "Selecting all columns can waste bandwidth and expose data.", "Select only required columns."),
+        (" OR \"", "bug", "medium", "Suspicious always-true OR condition", "A standalone string or expression in an OR condition can make it always true.", "Compare the variable on both sides or use membership checks."),
+        (" OR '", "bug", "medium", "Suspicious always-true OR condition", "A standalone string or expression in an OR condition can make it always true.", "Compare the variable on both sides or use membership checks."),
+        ("password = \"", "security", "high", "Hardcoded password", "A password-like value appears hardcoded.", "Move credentials to a secret manager or environment variable."),
+        ("api_token = \"", "security", "high", "Hardcoded API token", "An API token appears hardcoded.", "Move API tokens to a secret manager or environment variable."),
     ]
 
     if "python" in language_key or language_key in {"py", ""}:
@@ -249,6 +254,12 @@ def _deterministic_review(code: str, language: str) -> tuple[str, list[dict]]:
             ("random.randint(0, len(", "bug", "medium", "Off-by-one random index", "randint includes the upper bound.", "Use random.choice after checking the list is non-empty."),
             ("while True:", "bug", "medium", "Unbounded loop", "The loop has no visible stop condition.", "Add cancellation or a clear break condition."),
             ("return a / b", "bug", "medium", "Division by zero risk", "The divisor is not checked.", "Validate the divisor before dividing."),
+            ("return total / len(scores)", "bug", "medium", "Average can divide by zero", "The average divides by the list length without confirming it is non-empty.", "Return a default or raise a controlled error for empty input."),
+            ("return orders[0]", "bug", "medium", "Unsafe first item access", "Accessing index 0 can crash on empty lists.", "Check the list before indexing."),
+            ("profile[\"contact\"][\"email\"]", "bug", "medium", "Unsafe nested dictionary access", "Missing nested keys can crash.", "Use safe access and validate required fields."),
+            ("except:", "bug", "low", "Bare except hides errors", "A bare except can swallow important failures.", "Catch specific exception types."),
+            ("open(path, \"w\")", "bug", "medium", "File handle may leak", "Opening files without a context manager can leak handles.", "Use with open(...) as f."),
+            ("for i in range(0, len(names) + 1)", "bug", "medium", "Off-by-one loop", "The loop accesses one element beyond the list.", "Use range(len(names))."),
         ])
         if "conn = connect_db()" in code and "conn.close()" not in code and "with sqlite3.connect" not in code:
             checks.append(("conn = connect_db()", "bug", "medium", "Database connections are not closed", "Connections can leak resources.", "Use context managers or close connections in finally blocks."))
@@ -273,6 +284,13 @@ def _deterministic_review(code: str, language: str) -> tuple[str, list[dict]]:
             ("return a / b", "bug", "medium", "Division by zero risk", "The divisor is not checked.", "Validate b before dividing."),
             ("orders[0].total", "bug", "medium", "Unsafe first order access", "Accessing the first order can crash when orders is empty.", "Check orders.length first."),
             ("headers[\"user-agent\"].split", "bug", "medium", "Unsafe header access", "Missing user-agent header can crash.", "Use a default string before splitting."),
+            ("DB_PASSWORD = \"", "security", "high", "Hardcoded database password", "Database credentials are hardcoded.", "Load credentials from environment variables."),
+            ("JWT_SECRET = \"", "security", "high", "Hardcoded JWT secret", "JWT signing secrets are hardcoded.", "Load JWT secrets from a secret manager."),
+            ("API_TOKEN = \"", "security", "high", "Hardcoded API token", "API tokens are hardcoded.", "Load tokens from environment variables."),
+            ("db.query(query", "security", "high", "SQL injection risk", "A query string is executed directly and may include user input.", "Use parameterized queries/placeholders."),
+            ("fs.readFileSync(path", "security", "medium", "Unsafe file read path", "User-controlled file paths can read unintended files.", "Validate and constrain file paths."),
+            ("requestCounts[ip] = requestCounts[ip] + 1", "bug", "medium", "NaN rate limit counter", "Incrementing undefined produces NaN.", "Initialize counters with a default value."),
+            ("setTimeout(() =>", "bug", "medium", "Async state update race", "Delayed shared-state updates can race with other operations.", "Use atomic updates or locking/transactions."),
         ])
 
     if "java" in language_key:
@@ -280,6 +298,9 @@ def _deterministic_review(code: str, language: str) -> tuple[str, list[dict]]:
             ("MessageDigest.getInstance(\"MD5\")", "security", "high", "Insecure MD5 hashing", "MD5 is unsafe for passwords or auth tokens.", "Use bcrypt/argon2/PBKDF2 with salt and work factor."),
             ("Runtime.getRuntime().exec", "security", "critical", "Command injection risk", "Executing commands from code can be unsafe.", "Validate commands and avoid shell execution."),
             ("Statement statement", "security", "high", "SQL injection risk", "Raw SQL statements can concatenate user input.", "Use PreparedStatement."),
+            ("catch (Exception", "bug", "medium", "Overbroad exception handling", "Catching all exceptions can hide failures.", "Catch specific exception types."),
+            ("System.out.println", "security", "low", "Potential sensitive logging", "Printing data directly can leak sensitive values.", "Use structured logging and avoid secrets."),
+            ("new Random()", "security", "medium", "Weak randomness", "java.util.Random is not secure for sensitive use.", "Use SecureRandom for security-sensitive randomness."),
         ])
 
     issues = []
@@ -289,10 +310,10 @@ def _deterministic_review(code: str, language: str) -> tuple[str, list[dict]]:
             issues.append(_static_issue(code, needle, category, severity, title, description, suggestion))
 
     summary = "Static fallback review found likely issues after AI review output could not be parsed."
-    return summary, issues[:12]
+    return summary, issues[:_REVIEW_MAX_ISSUES]
 
 
-def _merge_static_findings(code: str, language: str, issues: list[dict], max_issues: int = 14) -> list[dict]:
+def _merge_static_findings(code: str, language: str, issues: list[dict], max_issues: int = _REVIEW_MAX_ISSUES) -> list[dict]:
     _, static_issues = _deterministic_review(code, language)
     merged = list(issues)
     seen = {
