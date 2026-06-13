@@ -139,7 +139,7 @@ async def _invoke_fix_with_fallback(messages: list, max_tokens: int = 4096) -> s
 _MAX_CODE_LINES = 300
 _MAX_FIX_ISSUES = 12
 _FIX_MAX_TOKENS = 8192
-_POLISH_MAX_ISSUES = 6
+_POLISH_MAX_ISSUES = 10
 
 
 def _truncate_code(code: str, max_lines: int = _MAX_CODE_LINES) -> tuple[str, bool]:
@@ -210,6 +210,99 @@ def _is_partial_fixed_code(original: str, fixed: str) -> bool:
     return len(fixed_lines) < max(25, int(len(original_lines) * 0.65))
 
 
+def _deterministic_security_issues(code: str) -> list[dict]:
+    """Catch obvious production-security leftovers the LLM audit can miss."""
+    checks = [
+        (
+            "hashlib.md5",
+            "security",
+            "high",
+            "Insecure MD5 hashing remains",
+            "Replace MD5 password/token hashing with bcrypt or secrets/HMAC as appropriate.",
+        ),
+        (
+            "os.environ.get(\"SECRET_KEY\",",
+            "security",
+            "high",
+            "Hardcoded SECRET_KEY fallback remains",
+            "Require SECRET_KEY from the environment and fail fast if missing.",
+        ),
+        (
+            "os.environ.get(\"API_TOKEN\",",
+            "security",
+            "high",
+            "Hardcoded API_TOKEN fallback remains",
+            "Require API_TOKEN from the environment and fail fast if missing.",
+        ),
+        (
+            "pickle.loads",
+            "security",
+            "critical",
+            "Unsafe pickle deserialization remains",
+            "Use JSON or another safe serialization format for untrusted input.",
+        ),
+        (
+            "shell=True",
+            "security",
+            "critical",
+            "Shell command execution remains",
+            "Use subprocess with an argument list and an allowlist of commands.",
+        ),
+        (
+            "return f\"<h1>Hello {name}</h1>\"",
+            "security",
+            "high",
+            "HTML output is not escaped",
+            "Escape user-controlled HTML values with html.escape before rendering.",
+        ),
+        (
+            "while True:",
+            "bug",
+            "medium",
+            "Unbounded worker loop remains",
+            "Add a stop condition or cancellation signal.",
+        ),
+        (
+            "time.sleep(0.1)",
+            "bug",
+            "high",
+            "Race-prone money transfer remains",
+            "Protect shared balance updates with a lock or transaction.",
+        ),
+        (
+            "os.path.join(UPLOAD_DIR, filename)",
+            "security",
+            "high",
+            "Path traversal risk remains",
+            "Normalize the filename and verify the resolved path stays inside UPLOAD_DIR.",
+        ),
+    ]
+
+    issues = []
+    for needle, category, severity, title, suggestion in checks:
+        if needle in code:
+            issues.append({
+                "category": category,
+                "severity": severity,
+                "title": title,
+                "description": title,
+                "suggestion": suggestion,
+                "code_snippet": needle,
+            })
+
+    if "connect_db()" in code and "conn.close()" not in code and "with sqlite3.connect" not in code:
+        issues.append({
+            "category": "bug",
+            "severity": "medium",
+            "title": "Database connections are not closed",
+            "description": "SQLite connections should be closed or managed with context managers.",
+            "suggestion": "Use with sqlite3.connect(DB_PATH) as conn or close connections in finally blocks.",
+            "code_snippet": "conn = connect_db()",
+        })
+
+    return issues
+
+
 def compute_unified_diff(original: str, fixed: str, language: str) -> str:
     orig_lines = original.splitlines(keepends=True)
     fixed_lines = fixed.splitlines(keepends=True)
@@ -273,7 +366,7 @@ Rules:
 - Return ONLY the JSON object, nothing before or after it"""
 
 
-POLISH_REVIEW_SYSTEM = """You are auditing code that was already auto-fixed.
+POLISH_REVIEW_SYSTEM = """You are auditing code that was already auto-fixed for production readiness.
 
 Return ONLY a valid JSON object:
 {
@@ -289,12 +382,24 @@ Return ONLY a valid JSON object:
   ]
 }
 
-Report at most 6 serious remaining bugs/security/performance issues. Ignore style-only issues. If the code is acceptable, return {"issues":[]}.
+Treat these as production blockers if present:
+- md5 or sha1 for passwords, reset tokens, or authentication tokens
+- hardcoded secret/API token fallbacks
+- unclosed database/file handles
+- unsafe pickle deserialization
+- subprocess shell injection or unvalidated command execution
+- unescaped HTML/XSS
+- path traversal after os.path.join with user filenames
+- race conditions in shared balance/state updates
+- inconsistent password hashing
+
+Report at most 10 serious remaining bugs/security/performance issues. Ignore style-only issues. If the code is acceptable for production, return {"issues":[]}.
 """
 
 
 async def _audit_fixed_code(code: str, language: str) -> list[dict]:
     code_for_llm, _ = _truncate_code(code)
+    deterministic_issues = _deterministic_security_issues(code)
     messages = [
         SystemMessage(content=POLISH_REVIEW_SYSTEM),
         HumanMessage(content=f"Language: {language}\n\n```\n{code_for_llm}\n```"),
@@ -302,10 +407,20 @@ async def _audit_fixed_code(code: str, language: str) -> list[dict]:
     try:
         raw = await _invoke_fix_with_fallback(messages, max_tokens=2048)
         issues = _parse_issue_list(raw)
-        return issues[:_POLISH_MAX_ISSUES]
     except Exception as e:
         logger.warning("fix_agent.polish_audit_failed", error=str(e))
-        return []
+        issues = []
+
+    combined = deterministic_issues + issues
+    seen = set()
+    unique = []
+    for issue in combined:
+        key = (issue.get("title"), issue.get("code_snippet"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    return unique[:_POLISH_MAX_ISSUES]
 
 
 async def _refine_fixed_code(
@@ -334,7 +449,16 @@ Current fixed code:
 Remaining issues to fix silently:
 {issues_summary}
 
-Return the JSON object as described. Preserve the complete current fixed file and only repair the listed remaining issues."""
+Production requirements:
+- Do not leave md5/sha1 for passwords, reset tokens, or auth tokens.
+- Do not leave hardcoded secret or token fallback values; require environment variables when needed.
+- Close database/file handles or use context managers.
+- Escape HTML output.
+- Prevent path traversal for upload/delete paths.
+- Avoid unsafe pickle and shell execution.
+- Protect shared money/state updates with locking or transactions.
+
+Return the JSON object as described. Preserve the complete current fixed file and repair all listed remaining issues."""
 
     raw = await _invoke_fix_with_fallback([
         SystemMessage(content=FIX_SYSTEM),
@@ -475,11 +599,14 @@ Return the JSON object as described. Fix only the listed issues."""
     explanations = result.get("explanations", {})
 
     if not was_truncated:
-        remaining_issues = await _audit_fixed_code(fixed_code, language)
-        if remaining_issues:
+        for polish_attempt in range(2):
+            remaining_issues = await _audit_fixed_code(fixed_code, language)
+            if not remaining_issues:
+                break
             logger.info(
                 "fix_agent.polish_refine_start",
                 review_id=review_id,
+                attempt=polish_attempt + 1,
                 remaining_count=len(remaining_issues),
             )
             try:
@@ -492,11 +619,13 @@ Return the JSON object as described. Fix only the listed issues."""
                     fixed_code = refined_code
                     plan = plan + polish_plan
                     explanations = {**explanations, **polish_explanations}
-                    logger.info("fix_agent.polish_refine_done", review_id=review_id)
+                    logger.info("fix_agent.polish_refine_done", review_id=review_id, attempt=polish_attempt + 1)
                 else:
                     logger.warning("fix_agent.polish_refine_partial_or_empty", review_id=review_id)
+                    break
             except Exception as e:
                 logger.warning("fix_agent.polish_refine_failed", review_id=review_id, error=str(e))
+                break
 
     # Emit plan
     yield {"type": "plan_done", "plan": plan}
