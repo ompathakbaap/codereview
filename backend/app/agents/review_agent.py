@@ -253,12 +253,10 @@ def build_review_graph() -> StateGraph:
 
     graph.add_edge("analyze_structure", "bug_check")
     graph.add_edge("analyze_structure", "security_check")
-    graph.add_edge("style_check", "aggregate")
     graph.add_edge("analyze_structure", "performance_check")
 
     graph.add_edge("bug_check", "aggregate")
     graph.add_edge("security_check", "aggregate")
-    graph.add_edge("style_check", "aggregate")
     graph.add_edge("performance_check", "aggregate")
 
     graph.add_edge("aggregate", END)
