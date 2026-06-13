@@ -113,7 +113,7 @@ def _parse_issues(raw: str, category: str) -> list[dict]:
 
 
 _MAX_REVIEW_CHARS = 10_000
-_REVIEW_MAX_TOKENS = 3072
+_REVIEW_MAX_TOKENS = 4096
 
 
 def _truncate_code_for_review(code: str) -> tuple[str, bool]:
@@ -184,7 +184,7 @@ Return ONLY a valid JSON object, no markdown:
   ]
 }
 
-Return at most 8 issues. Prioritize real bugs/security issues that would matter in a review demo. Keep all fields short. Do not invent issues. If no issues are found, return an empty issues array.
+Return at most 14 issues. Prioritize real bugs/security issues that would matter in a review demo. Keep all fields short. Do not invent issues. If no issues are found, return an empty issues array.
 """
 
 
@@ -260,6 +260,19 @@ def _deterministic_review(code: str, language: str) -> tuple[str, list[dict]]:
             ("localStorage", "security", "medium", "Sensitive data in localStorage", "localStorage is accessible to injected scripts.", "Avoid storing secrets in localStorage."),
             ("Math.random", "security", "medium", "Weak randomness", "Math.random is not cryptographically secure.", "Use crypto.getRandomValues for security-sensitive randomness."),
             ("JSON.parse(", "bug", "low", "JSON parse can throw", "JSON.parse may crash without error handling.", "Wrap parsing in try/catch for untrusted input."),
+            ("crypto.createHash(\"md5\")", "security", "high", "Insecure MD5 hashing", "MD5 is unsafe for passwords or auth tokens.", "Use bcrypt/argon2 for passwords."),
+            ("child_process.exec", "security", "critical", "Command injection risk", "child_process.exec can execute attacker-controlled commands.", "Use execFile/spawn with validated arguments."),
+            ("fs.writeFileSync(path", "security", "high", "Unsafe file write path", "User-controlled paths can cause path traversal.", "Normalize and validate paths inside the upload directory."),
+            ("fs.unlinkSync(\"uploads/\" + filename)", "security", "high", "Unsafe file deletion path", "User-controlled filenames can delete unintended files.", "Normalize and validate paths inside the upload directory."),
+            ("rows[0]", "bug", "medium", "Unchecked first row access", "Accessing rows[0] can crash when no rows are returned.", "Check rows.length before indexing."),
+            ("scores.length", "bug", "medium", "Division by zero/empty average risk", "Average calculation does not handle empty arrays correctly.", "Return a default or error for empty arrays."),
+            ("items[index].name", "bug", "medium", "Unsafe random item access", "The random index can point outside the array or items can be empty.", "Use bounds checks and Math.floor(Math.random() * items.length)."),
+            ("payment.status === \"paid\" || \"completed\"", "bug", "medium", "Always-true condition", "The string literal makes the condition truthy for every payment.", "Use ['paid', 'completed'].includes(payment.status)."),
+            ("return null;", "bug", "low", "Early return inside loop", "Returning null inside the loop can stop searching too early.", "Return null after the loop finishes."),
+            ("i <= names.length", "bug", "medium", "Off-by-one loop", "The loop accesses one element past the array end.", "Use i < names.length."),
+            ("return a / b", "bug", "medium", "Division by zero risk", "The divisor is not checked.", "Validate b before dividing."),
+            ("orders[0].total", "bug", "medium", "Unsafe first order access", "Accessing the first order can crash when orders is empty.", "Check orders.length first."),
+            ("headers[\"user-agent\"].split", "bug", "medium", "Unsafe header access", "Missing user-agent header can crash.", "Use a default string before splitting."),
         ])
 
     if "java" in language_key:
@@ -277,6 +290,32 @@ def _deterministic_review(code: str, language: str) -> tuple[str, list[dict]]:
 
     summary = "Static fallback review found likely issues after AI review output could not be parsed."
     return summary, issues[:12]
+
+
+def _merge_static_findings(code: str, language: str, issues: list[dict], max_issues: int = 14) -> list[dict]:
+    _, static_issues = _deterministic_review(code, language)
+    merged = list(issues)
+    seen = {
+        (
+            (issue.get("title") or "").lower(),
+            str(issue.get("line_start") or ""),
+            (issue.get("code_snippet") or "").lower(),
+        )
+        for issue in merged
+    }
+    for issue in static_issues:
+        key = (
+            (issue.get("title") or "").lower(),
+            str(issue.get("line_start") or ""),
+            (issue.get("code_snippet") or "").lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(issue)
+        if len(merged) >= max_issues:
+            break
+    return merged
 
 
 async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
@@ -297,7 +336,8 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
         llm = get_llm(max_tokens=_REVIEW_MAX_TOKENS)
         groq_retries = 3 if getattr(settings, "OLLAMA_BASE_URL", None) else 1
         response = await _invoke_with_retry(llm, messages, max_retries=groq_retries)
-        return _parse_review_result(response.content)
+        summary, issues = _parse_review_result(response.content)
+        return summary, _merge_static_findings(code_for_llm, language, issues)
     except Exception as e:
         if getattr(settings, "OLLAMA_BASE_URL", None):
             raise
@@ -312,7 +352,8 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
                 return _deterministic_review(code_for_llm, language)
             raise
         try:
-            return _parse_review_result(raw)
+            summary, issues = _parse_review_result(raw)
+            return summary, _merge_static_findings(code_for_llm, language, issues)
         except ValueError as parse_error:
             logger.warning("review_agent.gemini_parse_failed_retrying_compact", error=str(parse_error))
             compact_messages = [
@@ -327,7 +368,8 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
                     return _deterministic_review(code_for_llm, language)
                 raise
             try:
-                return _parse_review_result(raw)
+                summary, issues = _parse_review_result(raw)
+                return summary, _merge_static_findings(code_for_llm, language, issues)
             except ValueError as final_parse_error:
                 logger.warning(
                     "review_agent.all_model_parses_failed_using_static_fallback",
