@@ -153,6 +153,9 @@ _MAX_CODE_LINES = 300
 _MAX_FIX_ISSUES = 12
 _FIX_MAX_TOKENS = 8192
 _POLISH_MAX_ISSUES = 10
+_FAST_FIX_MAX_LINES = 200
+_MEDIUM_CHUNK_LINES = 180
+_LARGE_CHUNK_LINES = 120
 
 
 def _truncate_code(code: str, max_lines: int = _MAX_CODE_LINES) -> tuple[str, bool]:
@@ -347,6 +350,40 @@ def compute_line_changes(original: str, fixed: str) -> dict:
     }
 
 
+def _issue_line(issue: dict) -> int | None:
+    raw_line = issue.get("line_start")
+    try:
+        return int(raw_line) if raw_line not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _issues_for_chunk(issues: list[dict], start_line: int, end_line: int) -> list[dict]:
+    scoped = []
+    for issue in issues:
+        line = _issue_line(issue)
+        if line is None or start_line <= line <= end_line:
+            copy = dict(issue)
+            if line is not None:
+                copy["line_start"] = line - start_line + 1
+                if issue.get("line_end") not in (None, ""):
+                    try:
+                        copy["line_end"] = int(issue["line_end"]) - start_line + 1
+                    except (TypeError, ValueError):
+                        copy["line_end"] = copy["line_start"]
+            scoped.append(copy)
+    return scoped[:_MAX_FIX_ISSUES]
+
+
+def _chunk_code(code: str, chunk_size: int) -> list[tuple[int, int, str]]:
+    lines = code.splitlines()
+    chunks = []
+    for start in range(0, len(lines), chunk_size):
+        end = min(start + chunk_size, len(lines))
+        chunks.append((start + 1, end, "\n".join(lines[start:end])))
+    return chunks
+
+
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
 FIX_SYSTEM = """You are an expert software engineer and code reviewer.
@@ -493,6 +530,141 @@ Return the JSON object as described. Preserve the complete current fixed file an
     return refined_code, plan, explanations
 
 
+async def _fix_chunk(
+    chunk_code: str,
+    language: str,
+    chunk_issues: list[dict],
+    chunk_label: str,
+    max_tokens: int,
+) -> tuple[str, list[dict], dict]:
+    issues_summary = json.dumps([
+        {
+            "id": i.get("id", ""),
+            "category": i.get("category"),
+            "severity": i.get("severity"),
+            "title": i.get("title"),
+            "description": i.get("description"),
+            "suggestion": i.get("suggestion", ""),
+            "code_snippet": (i.get("code_snippet", "") or "")[:160],
+        }
+        for i in chunk_issues
+    ], indent=2)
+
+    prompt = f"""Language: {language}
+
+This is {chunk_label} of a larger file. Fix only this chunk and return the COMPLETE corrected chunk.
+
+Chunk code:
+{chunk_code}
+
+Issues to fix in this chunk:
+{issues_summary}
+
+Return the JSON object as described. Preserve code in this chunk that is unrelated to the listed issues."""
+
+    raw = await _invoke_fix_with_fallback([
+        SystemMessage(content=FIX_SYSTEM),
+        HumanMessage(content=prompt),
+    ], max_tokens=max_tokens)
+    result = _parse_fix_result(raw)
+    fixed_chunk = result.get("fixed_code", "").strip()
+    fixed_chunk = re.sub(r"^```[\w]*\n?", "", fixed_chunk)
+    fixed_chunk = re.sub(r"\n?```$", "", fixed_chunk).strip()
+    return fixed_chunk, result.get("plan", []), result.get("explanations", {})
+
+
+async def _stream_chunked_fix_progress(review_id: str, code: str, language: str, issues: list[dict]):
+    lines = code.splitlines()
+    total_lines = len(lines)
+    chunk_size = _MEDIUM_CHUNK_LINES if total_lines <= 500 else _LARGE_CHUNK_LINES
+    pause_seconds = 1.5 if total_lines <= 500 else 6
+    chunks = _chunk_code(code, chunk_size)
+
+    logger.info(
+        "fix_agent.chunked_start",
+        review_id=review_id,
+        total_lines=total_lines,
+        chunk_count=len(chunks),
+        chunk_size=chunk_size,
+    )
+
+    yield {"type": "fix_start", "issue_count": len(issues)}
+
+    fixed_chunks: list[str] = []
+    plan: list[dict] = []
+    explanations: dict = {}
+
+    for index, (start_line, end_line, chunk_code) in enumerate(chunks):
+        chunk_issues = _issues_for_chunk(issues, start_line, end_line)
+        if not chunk_issues:
+            fixed_chunks.append(chunk_code)
+        else:
+            chunk_label = f"chunk {index + 1}/{len(chunks)} lines {start_line}-{end_line}"
+            try:
+                fixed_chunk, chunk_plan, chunk_explanations = await _fix_chunk(
+                    chunk_code,
+                    language,
+                    chunk_issues,
+                    chunk_label,
+                    max_tokens=4096,
+                )
+            except Exception as first_error:
+                if not _is_rate_limit_or_service_error(first_error):
+                    raise
+                logger.warning(
+                    "fix_agent.chunk_rate_limited_retrying",
+                    review_id=review_id,
+                    chunk=index + 1,
+                    wait_seconds=pause_seconds * 3,
+                )
+                await asyncio.sleep(pause_seconds * 3)
+                fixed_chunk, chunk_plan, chunk_explanations = await _fix_chunk(
+                    chunk_code,
+                    language,
+                    chunk_issues,
+                    chunk_label,
+                    max_tokens=4096,
+                )
+
+            if not fixed_chunk:
+                fixed_chunk = chunk_code
+            fixed_chunks.append(fixed_chunk)
+            plan.extend(chunk_plan)
+            explanations.update(chunk_explanations)
+
+        if index < len(chunks) - 1:
+            await asyncio.sleep(pause_seconds)
+
+    fixed_code = "\n".join(fixed_chunks)
+    unified_diff = compute_unified_diff(code, fixed_code, language)
+    line_changes = compute_line_changes(code, fixed_code)
+
+    yield {"type": "plan_done", "plan": plan}
+    yield {"type": "fix_token", "text": fixed_code}
+    yield {
+        "type": "fix_code_done",
+        "fixed_code": fixed_code,
+        "diff": unified_diff,
+        "line_changes": line_changes,
+        "was_truncated": False,
+        "chunked": True,
+    }
+
+    for issue_id, explanation in explanations.items():
+        yield {"type": "explain_start", "issue_id": issue_id}
+        yield {"type": "explain_done", "issue_id": issue_id, "explanation": explanation}
+
+    yield {
+        "type": "complete",
+        "fixed_code": fixed_code,
+        "diff": unified_diff,
+        "line_changes": line_changes,
+        "explanations": explanations,
+        "was_truncated": False,
+        "chunked": True,
+    }
+
+
 # ── Streaming Generator ────────────────────────────────────────────────────────
 
 async def stream_fix_progress(review_id: str, code: str, language: str, issues: list[dict]):
@@ -510,6 +682,11 @@ async def stream_fix_progress(review_id: str, code: str, language: str, issues: 
       {"type": "complete", "fixed_code": "...", "diff": "...", "explanations": {...}, "was_truncated": bool}
       {"type": "error", "message": "..."}
     """
+    if len(code.splitlines()) > _FAST_FIX_MAX_LINES:
+        async for event in _stream_chunked_fix_progress(review_id, code, language, issues):
+            yield event
+        return
+
     yield {"type": "fix_start", "issue_count": len(issues)}
 
     code_for_llm, was_truncated = _truncate_code(code)
