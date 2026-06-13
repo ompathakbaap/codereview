@@ -14,6 +14,7 @@ Single-call design eliminates TPM accumulation across sequential requests,
 which was the root cause of Groq free-tier rate limit failures.
 """
 
+import asyncio
 import json
 import re
 import difflib
@@ -51,6 +52,24 @@ def get_llm(max_tokens: int | None = 4096):
         request_timeout=60,
         max_tokens=max_tokens,
     )
+
+
+# ── Retry wrapper ─────────────────────────────────────────────────────────────
+
+async def _invoke_with_retry(llm, messages: list, max_retries: int = 3):
+    """Invoke LLM with exponential backoff on 429 rate limit errors."""
+    for attempt in range(max_retries):
+        try:
+            return await llm.ainvoke(messages)
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate_limit" in err.lower():
+                wait = 2 ** attempt * 5  # 5s, 10s, 20s
+                logger.warning("fix_llm.rate_limited", attempt=attempt + 1, wait_seconds=wait)
+                await asyncio.sleep(wait)
+            else:
+                raise
+    raise Exception("Service busy — rate limit exceeded after retries. Please try again in a few minutes.")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -185,7 +204,9 @@ Return the JSON object as described."""
 
     try:
         llm = get_llm(max_tokens=4096)
-        response = await llm.ainvoke([
+        # Brief pause so fix calls don't immediately stack on top of review TPM usage
+        await asyncio.sleep(2)
+        response = await _invoke_with_retry(llm, [
             SystemMessage(content=FIX_SYSTEM),
             HumanMessage(content=prompt),
         ])
