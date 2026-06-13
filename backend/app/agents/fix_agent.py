@@ -1,5 +1,5 @@
 """
-Fix-It Agent — Groq-powered code fixer.
+Fix-It Agent — code fixer supporting Groq and Ollama backends.
 
 Given original code + list of issues from the review agent, this agent:
   1. Streams a complete fixed version of the code
@@ -9,14 +9,17 @@ Given original code + list of issues from the review agent, this agent:
 Graph flow:
   START → plan_fixes → generate_fixed_code → explain_changes → END
 
-All nodes use Groq (llama-3.3-70b-versatile), same as review_agent.
+Backend selection (mirrors review_agent):
+  - Ollama (local/offline): set OLLAMA_BASE_URL + OLLAMA_MODEL
+  - Groq  (default):        set GROQ_API_KEY + GROQ_MODEL
+
+For Groq's free tier, code is truncated to _MAX_CODE_LINES before being
+sent to stay within the per-request token budget.
 """
 
 import json
 import re
 import difflib
-from typing import TypedDict, Annotated, List
-from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.config import settings
 import structlog
@@ -26,7 +29,22 @@ logger = structlog.get_logger()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def get_llm(streaming: bool = False, max_tokens: int | None = None) -> ChatGroq:
+def get_llm(streaming: bool = False, max_tokens: int | None = None):
+    """
+    Returns ChatOllama if OLLAMA_BASE_URL is configured, else ChatGroq.
+    Mirrors the factory in review_agent so both agents share the same backend.
+    """
+    if getattr(settings, "OLLAMA_BASE_URL", None):
+        from langchain_ollama import ChatOllama
+        model = getattr(settings, "OLLAMA_MODEL", "llama3.2")
+        logger.info("fix_llm.backend", backend="ollama", model=model)
+        return ChatOllama(
+            base_url=settings.OLLAMA_BASE_URL,
+            model=model,
+            temperature=0.15,
+        )
+    from langchain_groq import ChatGroq
+    logger.info("fix_llm.backend", backend="groq", model=settings.GROQ_MODEL)
     return ChatGroq(
         api_key=settings.GROQ_API_KEY,
         model=settings.GROQ_MODEL,
@@ -36,6 +54,27 @@ def get_llm(streaming: bool = False, max_tokens: int | None = None) -> ChatGroq:
         request_timeout=30,
         max_tokens=max_tokens,
     )
+
+
+# Groq free-tier TPM limit: ~6000 tokens/min on llama-3.3-70b-versatile.
+# Each request to the fix step sends code + issues, so we cap code at ~80 lines
+# to stay comfortably inside the per-request token budget and leave room for
+# the model's output tokens.
+_MAX_CODE_LINES = 80
+
+
+def _truncate_code(code: str, max_lines: int = _MAX_CODE_LINES) -> tuple[str, bool]:
+    """
+    Returns (code_to_send, was_truncated).
+    If the code exceeds max_lines, we send only the first max_lines lines plus
+    a truncation notice so the LLM knows the file is partial.
+    """
+    lines = code.splitlines()
+    if len(lines) <= max_lines:
+        return code, False
+    truncated = "\n".join(lines[:max_lines])
+    notice = f"\n# ... [file truncated at line {max_lines} of {len(lines)} for token budget] ..."
+    return truncated + notice, True
 
 
 def compute_unified_diff(original: str, fixed: str, language: str) -> str:
@@ -122,20 +161,30 @@ async def stream_fix_progress(review_id: str, code: str, language: str, issues: 
       {"type": "fix_start", "issue_count": n}
       {"type": "plan_done", "plan": [...]}
       {"type": "fix_token", "text": "..."}          — fixed code tokens
-      {"type": "fix_code_done", "fixed_code": "...","diff": "...", "line_changes": {...}}
+      {"type": "fix_code_done", "fixed_code": "...","diff": "...", "line_changes": {...}, "was_truncated": bool}
       {"type": "explain_start", "issue_id": "..."}
       {"type": "explain_token", "issue_id": "...", "text": "..."}
       {"type": "explain_done", "issue_id": "...", "explanation": "..."}
-      {"type": "complete", "fixed_code": "...", "diff": "...", "explanations": {...}}
+      {"type": "complete", "fixed_code": "...", "diff": "...", "explanations": {...}, "was_truncated": bool}
       {"type": "error", "message": "..."}
     """
     import asyncio
 
     llm = get_llm()
-    llm_stream = get_llm(streaming=True)              # for full code generation — no cap needed
-    llm_explain = get_llm(streaming=True, max_tokens=300)  # for explanations — keep them concise
+    llm_stream = get_llm(streaming=True, max_tokens=2048)   # cap fix output to stay within TPM
+    llm_explain = get_llm(streaming=True, max_tokens=300)   # explanations stay concise
 
     yield {"type": "fix_start", "issue_count": len(issues)}
+
+    # Truncate code if it exceeds the safe line budget for Groq's free tier
+    code_for_llm, was_truncated = _truncate_code(code)
+    if was_truncated:
+        logger.warning(
+            "fix_agent.code_truncated",
+            review_id=review_id,
+            original_lines=len(code.splitlines()),
+            sent_lines=_MAX_CODE_LINES,
+        )
 
     # ── Step 1: Plan ───────────────────────────────────────────────────────────
     issues_summary = json.dumps([
@@ -146,7 +195,7 @@ async def stream_fix_progress(review_id: str, code: str, language: str, issues: 
 
     plan_resp = await llm.ainvoke([
         SystemMessage(content=PLAN_SYSTEM),
-        HumanMessage(content=f"Language: {language}\n\nCode:\n```\n{code}\n```\n\nIssues:\n{issues_summary}"),
+        HumanMessage(content=f"Language: {language}\n\nCode:\n```\n{code_for_llm}\n```\n\nIssues:\n{issues_summary}"),
     ])
 
     plan = []
@@ -165,7 +214,7 @@ async def stream_fix_progress(review_id: str, code: str, language: str, issues: 
     fix_prompt = f"""Language: {language}
 
 Original code:
-{code}
+{code_for_llm}
 
 Issues to fix:
 {json.dumps([{"id": p["issue_id"], "fix": p["fix_summary"]} for p in plan], indent=2)}
@@ -196,6 +245,7 @@ Output ONLY the complete corrected code:"""
         "fixed_code": fixed_code,
         "diff": unified_diff,
         "line_changes": line_changes,
+        "was_truncated": was_truncated,
     }
 
     # ── Step 3: Explain each issue's fix (streaming, sequential) ───────────────
@@ -210,7 +260,7 @@ Output ONLY the complete corrected code:"""
 
         yield {"type": "explain_start", "issue_id": issue_id}
 
-# Use only the relevant snippet instead of the full file to save tokens
+        # Use only the relevant snippet instead of the full file to save tokens
         snippet = issue.get("code_snippet") or "(snippet not available)"
 
         explain_prompt = f"""Language: {language}
@@ -229,7 +279,7 @@ Fix applied: {plan_item.get("fix_summary")}
 Explain what was wrong with this snippet and how the fix addresses it. Keep it concise."""
 
         explanation_parts = []
-        async for chunk in llm_stream.astream([
+        async for chunk in llm_explain.astream([
             SystemMessage(content=EXPLAIN_SYSTEM),
             HumanMessage(content=explain_prompt),
         ]):
@@ -248,4 +298,5 @@ Explain what was wrong with this snippet and how the fix addresses it. Keep it c
         "diff": unified_diff,
         "line_changes": line_changes,
         "explanations": explanations,
+        "was_truncated": was_truncated,
     }
