@@ -114,17 +114,30 @@ async def analyze_structure(state: ReviewState) -> dict:
 
 # -- Node: Bug Check ----------------------------------------------------------
 
-BUG_SYSTEM = """You are a code bug detector. Analyze the code for bugs, logic errors, null pointer issues, off-by-one errors, exception handling gaps, and incorrect assumptions.
+BUG_SYSTEM = """You are an expert bug hunter. Your job is to find EVERY bug, crash, and logic error in the code — do not skip any.
+
+Look specifically for ALL of the following:
+- CRASH BUGS: division by zero, index out of bounds, calling methods on None/null, empty list/dict access
+- LOGIC BUGS: return statement inside a loop (exits too early), wrong operator (= vs ==), off-by-one errors, incorrect conditionals
+- EXCEPTION HANDLING: bare `except:` or `except Exception:` that swallows errors silently, missing try/except around risky operations, catching too broadly (e.g. catching KeyboardInterrupt)
+- RESOURCE LEAKS: files opened but never closed (not using `with`), database connections never closed, sockets never closed
+- NULL/NONE ERRORS: no existence check before dict key access with `[]`, no check before `.get()` chained calls
+- UNREACHABLE CODE: code after a return/break/continue, conditions that can never be true
+- TYPE ERRORS: adding incompatible types, passing wrong type to a function
+- INFINITE LOOPS: while True with no guaranteed exit, missing break condition
+- CONCURRENCY BUGS: shared mutable state, race conditions
+
+Be thorough. If there are 10 bugs, report all 10. Do NOT merge multiple bugs into one. Do NOT skip a bug because it seems minor.
 
 Respond ONLY with a valid JSON array (no markdown, no explanation). Each element:
 {
   "severity": "critical|high|medium|low",
-  "line_start": "line number or null",
-  "line_end": "line number or null",
+  "line_start": <line number as integer or null>,
+  "line_end": <line number as integer or null>,
   "title": "short title",
-  "description": "what the bug is",
-  "suggestion": "how to fix it",
-  "code_snippet": "relevant code snippet"
+  "description": "what the bug is and why it causes a problem",
+  "suggestion": "exact fix with corrected code if possible",
+  "code_snippet": "the exact buggy lines from the code"
 }
 
 If no bugs found, return [].
