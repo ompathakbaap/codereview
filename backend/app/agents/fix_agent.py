@@ -49,7 +49,7 @@ def get_llm(max_tokens: int | None = 4096):
         model=settings.GROQ_MODEL,
         temperature=0.15,
         streaming=False,
-        max_retries=2,
+        max_retries=0,
         request_timeout=60,
         max_tokens=max_tokens,
     )
@@ -65,6 +65,8 @@ async def _invoke_with_retry(llm, messages: list, max_retries: int = 3):
         except Exception as e:
             err = str(e)
             if "429" in err or "rate_limit" in err.lower():
+                if attempt >= max_retries - 1:
+                    break
                 wait = 2 ** attempt * 5  # 5s, 10s, 20s
                 logger.warning("fix_llm.rate_limited", attempt=attempt + 1, wait_seconds=wait)
                 await asyncio.sleep(wait)

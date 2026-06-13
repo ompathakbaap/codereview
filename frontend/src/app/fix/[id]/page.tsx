@@ -76,12 +76,13 @@ const PHASES = [
 
 function PhaseStepper({ phase }: { phase: string }) {
   const phaseIndex = PHASES.findIndex((p) => p.key === phase);
+  const isComplete = phase === "complete";
   return (
     <div className="flex items-center gap-0 overflow-x-auto py-1">
       {PHASES.map((p, i) => {
         const Icon = p.icon;
-        const done = i < phaseIndex;
-        const active = i === phaseIndex;
+        const done = isComplete || i < phaseIndex;
+        const active = !isComplete && i === phaseIndex;
         return (
           <div key={p.key} className="flex items-center">
             <div

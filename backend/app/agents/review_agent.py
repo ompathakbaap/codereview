@@ -64,6 +64,8 @@ def get_llm(streaming: bool = False, max_tokens: int | None = None) -> BaseChatM
             model=settings.GROQ_MODEL,
             temperature=0.1,
             streaming=streaming,
+            max_retries=0,
+            request_timeout=45,
             **groq_kwargs,
         )
 
@@ -78,6 +80,8 @@ async def _invoke_with_retry(llm: BaseChatModel, messages: list, max_retries: in
         except Exception as e:
             err = str(e)
             if "429" in err or "rate_limit" in err.lower():
+                if attempt >= max_retries - 1:
+                    break
                 wait = 2 ** attempt * 5  # 5s, 10s, 20s
                 logger.warning("llm.rate_limited", attempt=attempt + 1, wait_seconds=wait)
                 await asyncio.sleep(wait)
@@ -182,7 +186,8 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
 
     try:
         llm = get_llm(max_tokens=2048)
-        response = await _invoke_with_retry(llm, messages)
+        groq_retries = 3 if getattr(settings, "OLLAMA_BASE_URL", None) else 1
+        response = await _invoke_with_retry(llm, messages, max_retries=groq_retries)
         return _parse_review_result(response.content)
     except Exception as e:
         if getattr(settings, "OLLAMA_BASE_URL", None):
