@@ -79,7 +79,18 @@ async def _invoke_with_retry(llm, messages: list, max_retries: int = 3):
 
 def _is_rate_limit_or_service_error(error: Exception) -> bool:
     err = str(error).lower()
-    return any(token in err for token in ["429", "rate_limit", "rate limit", "503", "overloaded", "timeout", "service busy"])
+    return any(token in err for token in [
+        "429",
+        "rate_limit",
+        "rate limit",
+        "rate-limited",
+        "temporarily rate",
+        "too many requests",
+        "503",
+        "overloaded",
+        "timeout",
+        "service busy",
+    ])
 
 
 def _friendly_provider_error(error: Exception) -> str:
