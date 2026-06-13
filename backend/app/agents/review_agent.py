@@ -88,7 +88,7 @@ async def _invoke_with_retry(llm: BaseChatModel, messages: list, max_retries: in
 
 def _is_rate_limit_or_service_error(error: Exception) -> bool:
     err = str(error).lower()
-    return any(token in err for token in ["429", "rate_limit", "rate limit", "503", "overloaded", "timeout"])
+    return any(token in err for token in ["429", "rate_limit", "rate limit", "503", "overloaded", "timeout", "malformed json"])
 
 
 # -- Issue parser -------------------------------------------------------------
@@ -128,7 +128,7 @@ Review the code for bugs, security problems, style/maintainability issues, and p
 
 Return ONLY a valid JSON object, no markdown:
 {
-  "summary": "2-3 sentence summary of what the code does",
+  "summary": "1 sentence summary of what the code does",
   "issues": [
     {
       "category": "bug|security|style|performance",
@@ -136,14 +136,14 @@ Return ONLY a valid JSON object, no markdown:
       "line_start": <line number as integer or null>,
       "line_end": <line number as integer or null>,
       "title": "short title",
-      "description": "what is wrong and why it matters",
-      "suggestion": "specific remediation",
-      "code_snippet": "the exact relevant code"
+      "description": "one concise sentence",
+      "suggestion": "one concise sentence",
+      "code_snippet": "short snippet, max 120 chars"
     }
   ]
 }
 
-Prioritize real issues that would matter in a review demo. Do not invent issues. If no issues are found, return an empty issues array.
+Return at most 12 issues. Prioritize real bugs/security issues that would matter in a review demo. Do not invent issues. If no issues are found, return an empty issues array.
 """
 
 
@@ -163,7 +163,7 @@ def _parse_review_result(raw: str) -> tuple[str, list[dict]]:
         return summary, issues
     except Exception as e:
         logger.warning("parse_review_result_failed", error=str(e))
-        return "", []
+        raise ValueError("Review model returned malformed JSON.") from e
 
 
 async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
