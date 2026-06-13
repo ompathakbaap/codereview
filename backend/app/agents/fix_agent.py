@@ -136,8 +136,8 @@ async def _invoke_fix_with_fallback(messages: list, max_tokens: int = 4096) -> s
         return await _invoke_gemini_fix(messages, max_tokens=max_tokens)
 
 
-_MAX_CODE_LINES = 80
-_MAX_FIX_ISSUES = 8
+_MAX_CODE_LINES = 300
+_MAX_FIX_ISSUES = 12
 _FIX_MAX_TOKENS = 8192
 
 
@@ -192,6 +192,15 @@ def _extract_json_object(raw: str) -> str:
 
 def _parse_fix_result(raw: str) -> dict:
     return json.loads(_extract_json_object(raw))
+
+
+def _is_partial_fixed_code(original: str, fixed: str) -> bool:
+    """Catch obviously partial outputs before showing them as successful fixes."""
+    original_lines = [line for line in original.splitlines() if line.strip()]
+    fixed_lines = [line for line in fixed.splitlines() if line.strip()]
+    if len(original_lines) < 40:
+        return False
+    return len(fixed_lines) < max(25, int(len(original_lines) * 0.65))
 
 
 def compute_unified_diff(original: str, fixed: str, language: str) -> str:
@@ -249,6 +258,7 @@ Return ONLY this JSON structure, no markdown, no explanation, nothing else:
 Rules:
 - fixed_code must be the COMPLETE corrected file, not a snippet
 - Fix every issue in the list
+- Preserve all functions/imports/code that are not directly related to a fix
 - Do not add new features, only fix what is listed
 - Do not wrap fixed_code in markdown code fences
 - Include an explanation for every issue id
@@ -341,6 +351,42 @@ Return the JSON object as described. Fix only the listed issues."""
     fixed_code = result.get("fixed_code", "").strip()
     fixed_code = re.sub(r"^```[\w]*\n?", "", fixed_code)
     fixed_code = re.sub(r"\n?```$", "", fixed_code).strip()
+
+    if not was_truncated and _is_partial_fixed_code(code, fixed_code):
+        if getattr(settings, "OLLAMA_BASE_URL", None) or not getattr(settings, "GEMINI_API_KEY", None):
+            logger.error(
+                "fix_agent.partial_fixed_code",
+                review_id=review_id,
+                original_lines=len(code.splitlines()),
+                fixed_lines=len(fixed_code.splitlines()),
+            )
+            yield {"type": "error", "message": "Fix agent returned partial code. Please try again."}
+            return
+
+        logger.warning(
+            "fix_agent.partial_fixed_code_retrying_gemini",
+            review_id=review_id,
+            original_lines=len(code.splitlines()),
+            fixed_lines=len(fixed_code.splitlines()),
+        )
+        retry_prompt = prompt + "\n\nThe previous answer was partial. Return the COMPLETE corrected file, preserving every function from the input."
+        try:
+            raw = await _invoke_gemini_fix([
+                SystemMessage(content=FIX_SYSTEM),
+                HumanMessage(content=retry_prompt),
+            ], max_tokens=_FIX_MAX_TOKENS)
+            result = _parse_fix_result(raw)
+            fixed_code = result.get("fixed_code", "").strip()
+            fixed_code = re.sub(r"^```[\w]*\n?", "", fixed_code)
+            fixed_code = re.sub(r"\n?```$", "", fixed_code).strip()
+        except Exception as e:
+            logger.error("fix_agent.partial_retry_failed", review_id=review_id, error=str(e))
+            yield {"type": "error", "message": "Fix agent returned partial code. Please try again."}
+            return
+
+        if _is_partial_fixed_code(code, fixed_code):
+            yield {"type": "error", "message": "Fix agent returned partial code. Please try a smaller file or fewer issues."}
+            return
 
     plan = result.get("plan", [])
     explanations = result.get("explanations", {})
