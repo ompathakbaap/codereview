@@ -365,29 +365,18 @@ async def stream_review_progress(review_id: str, code: str, language: str):
     ])
     yield {"type": "node_done", "node": "analyze_structure", "issue_count": 0, "summary": struct_resp.content}
 
-    # Step 2: parallel checks
-    queue: asyncio.Queue = asyncio.Queue()
-    parallel_nodes = ["bug_check", "security_check", "performance_check"]
+    # Step 2: sequential checks (parallel caused TPM rate limit failures on Groq free tier)
+    sequential_nodes = ["bug_check", "security_check", "performance_check"]
     total_issues = 0
     all_issues = []
 
-    async def drain_node(node: str):
+    for node in sequential_nodes:
         async for event in _stream_node(node, code, language):
-            await queue.put(event)
-        await queue.put({"type": "_node_finished_sentinel", "node": node})
+            if event.get("type") == "node_done":
+                total_issues += event.get("issue_count", 0)
+                all_issues.extend(event.get("issues", []))
+            yield event
+        # Small pause between nodes to stay within Groq free-tier TPM window
+        await asyncio.sleep(2)
 
-    tasks = [asyncio.create_task(drain_node(n)) for n in parallel_nodes]
-    finished = 0
-
-    while finished < len(parallel_nodes):
-        event = await queue.get()
-        if event.get("type") == "_node_finished_sentinel":
-            finished += 1
-            continue
-        if event.get("type") == "node_done":
-            total_issues += event.get("issue_count", 0)
-            all_issues.extend(event.get("issues", []))
-        yield event
-
-    await asyncio.gather(*tasks, return_exceptions=True)
     yield {"type": "complete", "issue_count": total_issues, "issues": all_issues}
