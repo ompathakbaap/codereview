@@ -205,6 +205,80 @@ def _parse_review_result(raw: str) -> tuple[str, list[dict]]:
         raise ValueError("Review model returned malformed JSON.") from e
 
 
+def _line_number_for(code: str, needle: str) -> int | None:
+    for index, line in enumerate(code.splitlines(), start=1):
+        if needle in line:
+            return index
+    return None
+
+
+def _static_issue(code: str, needle: str, category: str, severity: str, title: str, description: str, suggestion: str) -> dict:
+    line = _line_number_for(code, needle)
+    return {
+        "category": category,
+        "severity": severity,
+        "line_start": line,
+        "line_end": line,
+        "title": title,
+        "description": description,
+        "suggestion": suggestion,
+        "code_snippet": needle,
+    }
+
+
+def _deterministic_review(code: str, language: str) -> tuple[str, list[dict]]:
+    """Language-aware fallback review for demo reliability when model JSON is malformed."""
+    language_key = (language or "").lower()
+    checks = [
+        ("api_key", "security", "high", "Possible hardcoded API key", "A secret-like identifier appears in source.", "Move secrets to environment variables."),
+        ("password", "security", "medium", "Password handling needs review", "Password-related code is present and may require secure hashing/storage.", "Use a proven password hashing library and avoid plaintext storage."),
+        ("secret", "security", "high", "Possible hardcoded secret", "A secret-like value appears in source.", "Move secrets to environment variables or a secret manager."),
+        ("token", "security", "medium", "Token handling needs review", "Token-related code is present and may be hardcoded or weakly validated.", "Use secure token generation and constant-time comparison where appropriate."),
+        ("eval(", "security", "critical", "Dynamic code execution", "eval can execute attacker-controlled code.", "Avoid eval and use safe parsers/allowlists."),
+        ("exec(", "security", "critical", "Dynamic code execution", "exec can execute attacker-controlled code.", "Avoid exec and use safe parsers/allowlists."),
+        ("shell=True", "security", "critical", "Command injection risk", "Shell execution can run attacker-controlled commands.", "Use argument arrays and validate allowed commands."),
+        ("innerHTML", "security", "high", "Potential XSS", "Writing to innerHTML can execute untrusted markup.", "Use textContent or sanitize trusted HTML."),
+        ("dangerouslySetInnerHTML", "security", "high", "Potential XSS", "dangerouslySetInnerHTML can render untrusted HTML.", "Sanitize HTML or avoid raw HTML rendering."),
+        ("SELECT *", "performance", "low", "Broad database selection", "Selecting all columns can waste bandwidth and expose data.", "Select only required columns."),
+    ]
+
+    if "python" in language_key or language_key in {"py", ""}:
+        checks.extend([
+            ("hashlib.md5", "security", "high", "Insecure MD5 hashing", "MD5 is unsafe for passwords or auth tokens.", "Use bcrypt/argon2 for passwords and secrets/HMAC for tokens."),
+            ("pickle.loads", "security", "critical", "Unsafe deserialization", "pickle.loads can execute code with untrusted data.", "Use JSON or another safe format."),
+            ("random.randint(0, len(", "bug", "medium", "Off-by-one random index", "randint includes the upper bound.", "Use random.choice after checking the list is non-empty."),
+            ("while True:", "bug", "medium", "Unbounded loop", "The loop has no visible stop condition.", "Add cancellation or a clear break condition."),
+            ("return a / b", "bug", "medium", "Division by zero risk", "The divisor is not checked.", "Validate the divisor before dividing."),
+        ])
+        if "conn = connect_db()" in code and "conn.close()" not in code and "with sqlite3.connect" not in code:
+            checks.append(("conn = connect_db()", "bug", "medium", "Database connections are not closed", "Connections can leak resources.", "Use context managers or close connections in finally blocks."))
+        if "\" + username + \"" in code or "\" + str(user_id)" in code or "\" + keyword + \"" in code:
+            checks.append(("cursor.execute", "security", "critical", "SQL injection risk", "SQL queries appear to use string concatenation.", "Use parameterized queries."))
+
+    if any(lang in language_key for lang in ["javascript", "typescript", "js", "ts", "tsx", "jsx"]):
+        checks.extend([
+            ("localStorage", "security", "medium", "Sensitive data in localStorage", "localStorage is accessible to injected scripts.", "Avoid storing secrets in localStorage."),
+            ("Math.random", "security", "medium", "Weak randomness", "Math.random is not cryptographically secure.", "Use crypto.getRandomValues for security-sensitive randomness."),
+            ("JSON.parse(", "bug", "low", "JSON parse can throw", "JSON.parse may crash without error handling.", "Wrap parsing in try/catch for untrusted input."),
+        ])
+
+    if "java" in language_key:
+        checks.extend([
+            ("MessageDigest.getInstance(\"MD5\")", "security", "high", "Insecure MD5 hashing", "MD5 is unsafe for passwords or auth tokens.", "Use bcrypt/argon2/PBKDF2 with salt and work factor."),
+            ("Runtime.getRuntime().exec", "security", "critical", "Command injection risk", "Executing commands from code can be unsafe.", "Validate commands and avoid shell execution."),
+            ("Statement statement", "security", "high", "SQL injection risk", "Raw SQL statements can concatenate user input.", "Use PreparedStatement."),
+        ])
+
+    issues = []
+    lowered_code = code.lower()
+    for needle, category, severity, title, description, suggestion in checks:
+        if needle.lower() in lowered_code:
+            issues.append(_static_issue(code, needle, category, severity, title, description, suggestion))
+
+    summary = "Static fallback review found likely issues after AI review output could not be parsed."
+    return summary, issues[:12]
+
+
 async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
     code_for_llm, was_truncated = _truncate_code_for_review(code)
     if was_truncated:
@@ -240,7 +314,15 @@ async def review_all_once(code: str, language: str) -> tuple[str, list[dict]]:
                 HumanMessage(content=f"Language: {language}\n\n```\n{code_for_llm}\n```"),
             ]
             raw = await _invoke_gemini_review(compact_messages, max_tokens=2048)
-            return _parse_review_result(raw)
+            try:
+                return _parse_review_result(raw)
+            except ValueError as final_parse_error:
+                logger.warning(
+                    "review_agent.all_model_parses_failed_using_static_fallback",
+                    error=str(final_parse_error),
+                    language=language,
+                )
+                return _deterministic_review(code_for_llm, language)
 
 
 async def _invoke_gemini_review(messages: list, max_tokens: int = 2048) -> str:
