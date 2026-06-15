@@ -489,7 +489,15 @@ Rules:
 - Do not wrap fixed_code in markdown code fences
 - Include an explanation for every issue id
 - Keep explanations concise to avoid truncated JSON
-- Return ONLY the JSON object, nothing before or after it"""
+- Return ONLY the JSON object, nothing before or after it
+
+CRITICAL — do NOT introduce new bugs while fixing:
+- NEVER change indentation of class methods — a method inside a class must stay inside the class
+- NEVER add a return statement inside a for/while loop unless the original code had one there
+- NEVER remove try/except blocks unless the issue explicitly says to
+- If fixing a bare except, replace with specific exception types — do not remove the handler
+- If fixing a return inside a loop, move the return AFTER the loop ends, do not delete it
+- Double-check every def inside a class is indented exactly 4 spaces inside the class body"""
 
 
 POLISH_REVIEW_SYSTEM = """You are auditing code that was already auto-fixed for production readiness.
